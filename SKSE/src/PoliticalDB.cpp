@@ -1,12 +1,13 @@
 /**
  * PoliticalDB Implementation
  *
- * SQLite wrapper for IntelEngine.db. All faction politics data stored here.
+ * Save-owned in-memory SQLite working set with an SKSE co-save snapshot.
  * Independent from SkyrimNet's database.
  */
 
 #include "PoliticalDB.h"
-#include "FactionPolitics.h"  // for MAX_EVENT_DESCRIPTION_LENGTH, MAX_EVENT_REPLAY_LIMIT
+#include "PoliticalSnapshot.h"
+#include "FactionPolitics.h"  // for political relation/description limits
 
 #include <algorithm>
 #include <filesystem>
@@ -17,36 +18,135 @@ namespace IntelEngine {
     // Lifecycle
     // =========================================================================
 
-    bool PoliticalDB::Initialize(const std::string& dbPath) {
-        std::lock_guard<std::mutex> lock(mutex_);
-
-        if (db_) return true;  // Already open
-
-        auto dir = std::filesystem::path(dbPath).parent_path();
-        if (!std::filesystem::exists(dir)) {
-            std::filesystem::create_directories(dir);
+    bool PoliticalDB::Initialize(const std::string& legacyPath, float currentGameTime) {
+        bool imported = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (db_) return true;
+            // An unreadable/newer snapshot belongs to this save. Never replace it
+            // with another timeline's external DB; Save preserves its opaque bytes.
+            if (snapshotSeen_) return false;
+            auto working = Persistence::OpenMemoryDatabase();
+            if (!working) return false;
+            std::error_code ec;
+            const auto path = std::filesystem::u8path(legacyPath);
+            if (!legacyPath.empty() && std::filesystem::exists(path, ec)) {
+                sqlite3* raw = nullptr;
+                const int rc = sqlite3_open_v2(legacyPath.c_str(), &raw,
+                    SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nullptr);
+                Persistence::Database legacy(raw);
+                if (rc != SQLITE_OK || !Persistence::CopyDatabase(working.get(), legacy.get())) {
+                    logger::error("PoliticalDB: Legacy import failed; original database is unchanged: {}", legacyPath);
+                    return false;
+                }
+                imported = true;
+            } else if (ec) {
+                logger::error("PoliticalDB: Cannot inspect legacy database: {}", ec.message());
+                return false;
+            }
+            db_ = working.release();
+            if (!Execute("PRAGMA journal_mode=MEMORY; PRAGMA foreign_keys=ON") || !CreateTables()) {
+                sqlite3_close(db_);
+                db_ = nullptr;
+                return false;
+            }
         }
-
-        int rc = sqlite3_open(dbPath.c_str(), &db_);
-        if (rc != SQLITE_OK) {
-            logger::error("PoliticalDB: Failed to open {}: {}", dbPath, sqlite3_errmsg(db_));
-            sqlite3_close(db_);
-            db_ = nullptr;
-            return false;
+        if (imported) {
+            // Old releases did not snapshot politics. Import the available history
+            // at this save's time, without ever pruning the original external file.
+            // Seed missing legacy history before trimming. Seeding after a trim
+            // could reintroduce the future standing whose final event was removed.
+            RecalculatePlayerStandings(true);
+            CleanupFutureEvents(currentGameTime);
+            RecalculatePlayerStandings();
+            logger::info("PoliticalDB: Imported legacy state read-only into this save's working set: {}", legacyPath);
+        } else {
+            logger::info("PoliticalDB: Created empty save-owned working set");
         }
-
-        Execute("PRAGMA journal_mode=WAL");
-        Execute("PRAGMA foreign_keys=ON");
-
-        if (!CreateTables()) {
-            logger::error("PoliticalDB: Failed to create tables");
-            sqlite3_close(db_);
-            db_ = nullptr;
-            return false;
-        }
-
-        logger::info("PoliticalDB: Initialized at {}", dbPath);
         return true;
+    }
+
+    bool PoliticalDB::IsReady() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return db_ != nullptr;
+    }
+
+    bool PoliticalDB::HasSnapshot() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return snapshotRestored_;
+    }
+
+    void PoliticalDB::Revert() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (db_) sqlite3_close(db_);
+        db_ = nullptr;
+        snapshotSeen_ = false;
+        snapshotRestored_ = false;
+        opaqueSnapshot_.clear();
+        opaqueVersion_ = 0;
+    }
+
+    void PoliticalDB::Save(SKSE::SerializationInterface* intfc) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!db_) {
+            if (snapshotSeen_ && intfc->OpenRecord(SNAPSHOT_RECORD, opaqueVersion_))
+                intfc->WriteRecordData(opaqueSnapshot_.data(), static_cast<uint32_t>(opaqueSnapshot_.size()));
+            return;
+        }
+        std::vector<unsigned char> bytes;
+        if (!Persistence::EncodePoliticalSnapshot(db_, bytes)) {
+            logger::critical("PoliticalDB: Cannot encode bounded co-save snapshot; no partial record written");
+            return;
+        }
+        if (!intfc->OpenRecord(SNAPSHOT_RECORD, SNAPSHOT_VERSION) ||
+            !intfc->WriteRecordData(bytes.data(), static_cast<uint32_t>(bytes.size()))) {
+            logger::error("PoliticalDB: Failed to write IEPD snapshot");
+        }
+    }
+
+    void PoliticalDB::Load(SKSE::SerializationInterface* intfc, uint32_t version, uint32_t length) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (snapshotSeen_) {
+            logger::error("PoliticalDB: Duplicate IEPD record ignored");
+            return;
+        }
+        snapshotSeen_ = true;
+        opaqueVersion_ = version;
+        auto suspendUnreadable = [&](uint32_t bytesRead) {
+            // An incomplete or oversized record cannot be retained honestly under
+            // the allocation bound. Persist an explicit inert version-0 diagnostic
+            // on the next game save, never a fabricated empty v1 database. The
+            // original save is not modified, and no legacy timeline is substituted.
+            const uint32_t diagnostic[] = {0x49455046, version, length, bytesRead}; // IEPF
+            const auto* first = reinterpret_cast<const unsigned char*>(diagnostic);
+            opaqueSnapshot_.assign(first, first + sizeof(diagnostic));
+            opaqueVersion_ = 0;
+            logger::critical("PoliticalDB: IEPD v{} ({} bytes) unreadable; later saves retain a disabled-state marker, not the original payload", version, length);
+        };
+        if (length > Persistence::MAX_POLITICAL_BYTES) {
+            suspendUnreadable(0);
+            return;
+        }
+        opaqueSnapshot_.resize(length);
+        const auto bytesRead = intfc->ReadRecordData(opaqueSnapshot_.data(), length);
+        if (bytesRead != length) {
+            suspendUnreadable(bytesRead);
+            return;
+        }
+        if (version != SNAPSHOT_VERSION) {
+            logger::warn("PoliticalDB: Preserving unsupported IEPD v{} unchanged; politics inactive", version);
+            return;
+        }
+        auto restored = Persistence::DecodePoliticalSnapshot(opaqueSnapshot_);
+        if (!restored) {
+            logger::error("PoliticalDB: Invalid IEPD database; preserving record without external fallback");
+            return;
+        }
+        if (db_) sqlite3_close(db_);
+        db_ = restored.release();
+        snapshotRestored_ = true;
+        opaqueSnapshot_.clear();
+        logger::info("PoliticalDB: Restored authoritative IEPD snapshot ({} bytes)", length);
     }
 
     void PoliticalDB::Shutdown() {
@@ -391,13 +491,12 @@ namespace IntelEngine {
 
         const char* sql = R"SQL(
             SELECT id, faction_a, faction_b, event_type, description, relation_delta, game_time, instigator_npc
-            FROM faction_events ORDER BY game_time ASC LIMIT ?
+            FROM faction_events ORDER BY game_time ASC, id ASC
         )SQL";
 
         sqlite3_stmt* stmt = nullptr;
         if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) return results;
 
-        sqlite3_bind_int(stmt, 1, MAX_EVENT_REPLAY_LIMIT);
 
         while (sqlite3_step(stmt) == SQLITE_ROW) {
             results.push_back(ReadEventRow(stmt));
@@ -506,9 +605,9 @@ namespace IntelEngine {
         return results;
     }
 
-    void PoliticalDB::RecalculatePlayerStandings() {
+    void PoliticalDB::RecalculatePlayerStandings(bool seedLegacyHistory) {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (!db_) return;
+        if (!db_ || snapshotRestored_) return;
 
         sqlite3_exec(db_, "BEGIN", nullptr, nullptr, nullptr);
 
@@ -522,7 +621,7 @@ namespace IntelEngine {
                 sqlite3_finalize(countStmt);
             }
 
-            if (historyCount == 0) {
+            if (historyCount == 0 && seedLegacyHistory) {
                 // Seed history from existing standings (one entry per faction with current standing as delta)
                 sqlite3_stmt* readStmt = nullptr;
                 if (sqlite3_prepare_v2(db_, "SELECT faction_id, standing, last_change_time FROM player_faction_standing WHERE standing != 0",
@@ -554,19 +653,21 @@ namespace IntelEngine {
         }
 
         // Reset all player standings to 0
-        sqlite3_exec(db_, "DELETE FROM player_faction_standing", nullptr, nullptr, nullptr);
+        sqlite3_exec(db_, "UPDATE player_faction_standing SET standing = 0, last_change_time = 0", nullptr, nullptr, nullptr);
 
         // Replay all standing history events (chronological) to rebuild accurate standings
-        const char* sql = "SELECT faction_id, delta FROM player_standing_history ORDER BY game_time ASC";
+        const char* sql = "SELECT faction_id, delta, game_time FROM player_standing_history ORDER BY game_time ASC, id ASC";
         sqlite3_stmt* stmt = nullptr;
         if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) return;
 
         std::unordered_map<std::string, int> standings;
+        std::unordered_map<std::string, double> changeTimes;
         int replayed = 0;
         while (sqlite3_step(stmt) == SQLITE_ROW) {
             std::string factionId = SafeColumnText(stmt, 0);
             int delta = sqlite3_column_int(stmt, 1);
             standings[factionId] = std::clamp(standings[factionId] + delta, RELATION_MIN, RELATION_MAX);
+            changeTimes[factionId] = sqlite3_column_double(stmt, 2);
             replayed++;
         }
         sqlite3_finalize(stmt);
@@ -574,13 +675,14 @@ namespace IntelEngine {
         // Write recalculated standings back
         for (const auto& [factionId, standing] : standings) {
             const char* upsert = R"SQL(
-                INSERT INTO player_faction_standing (faction_id, standing) VALUES (?, ?)
-                ON CONFLICT(faction_id) DO UPDATE SET standing = excluded.standing
+                INSERT INTO player_faction_standing (faction_id, standing, last_change_time) VALUES (?, ?, ?)
+                ON CONFLICT(faction_id) DO UPDATE SET standing = excluded.standing, last_change_time = excluded.last_change_time
             )SQL";
             sqlite3_stmt* uStmt = nullptr;
             if (sqlite3_prepare_v2(db_, upsert, -1, &uStmt, nullptr) == SQLITE_OK) {
                 sqlite3_bind_text(uStmt, 1, factionId.c_str(), -1, SQLITE_TRANSIENT);
                 sqlite3_bind_int(uStmt, 2, standing);
+                sqlite3_bind_double(uStmt, 3, changeTimes[factionId]);
                 sqlite3_step(uStmt);
                 sqlite3_finalize(uStmt);
             }
@@ -648,7 +750,7 @@ namespace IntelEngine {
 
     int PoliticalDB::CleanupFutureEvents(float currentGameTime) {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (!db_) return 0;
+        if (!db_ || snapshotRestored_) return 0;
 
         sqlite3_exec(db_, "BEGIN", nullptr, nullptr, nullptr);
 
@@ -766,6 +868,18 @@ namespace IntelEngine {
                 sqlite3_finalize(stmt);
             }
         }
+
+        // Reconcile the materialized war flags with the surviving imported rows.
+        // Removing a future war must not leave factions marked as still at war.
+        sqlite3_exec(db_, R"SQL(
+            UPDATE faction_relations SET
+                war_active = EXISTS(SELECT 1 FROM faction_wars w
+                    WHERE w.faction_a = faction_relations.faction_a
+                      AND w.faction_b = faction_relations.faction_b AND w.end_time IS NULL),
+                war_start_time = (SELECT MAX(w.start_time) FROM faction_wars w
+                    WHERE w.faction_a = faction_relations.faction_a
+                      AND w.faction_b = faction_relations.faction_b AND w.end_time IS NULL)
+        )SQL", nullptr, nullptr, nullptr);
 
         if (totalDeleted > 0) {
             logger::info("PoliticalDB: Timeline cleanup deleted {} future rows (game_time > {:.2f})", totalDeleted, currentGameTime);

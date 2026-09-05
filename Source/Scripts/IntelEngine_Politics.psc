@@ -23,6 +23,8 @@ IntelEngine_Core Property Core Auto
 IntelEngine_StoryEngine Property StoryEngine Auto
 IntelEngine_Battle Property Battle Auto
 
+Bool Property LegacyAutomationRetired = false Auto Hidden
+
 ; === State ===
 Float Property LastTickGameTime = 0.0 Auto Hidden
 Bool Property TickPending = false Auto Hidden
@@ -33,6 +35,9 @@ Bool Property Initialized = false Auto Hidden
 ; =============================================================================
 
 Function Initialize()
+    If LegacyAutomationRetired
+        Return
+    EndIf
     If !IntelEngine.IsPoliticsEnabled()
         Core.DebugMsg("Politics: Disabled in settings")
         return
@@ -49,6 +54,9 @@ EndFunction
 ; =============================================================================
 
 Function StartScheduler()
+    If LegacyAutomationRetired
+        Return
+    EndIf
     ; Politics does not own a timer. Ticking is driven by StoryEngine.TickScheduler
     ; which calls Politics.TickNow() alongside Story DM and NPC DM. This way the
     ; idle-poll backup that drives those two systems also drives Politics.
@@ -67,6 +75,9 @@ EndFunction
 ; Called from StoryEngine.TickScheduler on every scheduler poll. Self-gates
 ; on the configured politics interval so it's safe to call at any cadence.
 Function TickNow()
+    If LegacyAutomationRetired
+        Return
+    EndIf
     If !Initialized || !IntelEngine.IsPoliticsEnabled()
         return
     EndIf
@@ -98,6 +109,9 @@ EndFunction
 ; =============================================================================
 
 Function RunPoliticalTick(Float currentGameTime)
+    If LegacyAutomationRetired
+        Return
+    EndIf
     TickPending = true
     IntelEngine.MarkSystemPending("politics", currentGameTime)
     LastTickGameTime = currentGameTime
@@ -113,6 +127,13 @@ Function RunPoliticalTick(Float currentGameTime)
 EndFunction
 
 Function OnPoliticsDMContextReady(String contextJson)
+    If LegacyAutomationRetired
+        Return
+    EndIf
+    If !IntelEngine.IsCurrentSessionResponse(contextJson)
+        Return
+    EndIf
+    contextJson = IntelEngine.UnwrapSessionResponse(contextJson)
     If contextJson == "" || contextJson == "{}"
         Core.DebugMsg("Politics: Empty context, skipping tick")
         TickPending = false
@@ -121,7 +142,7 @@ Function OnPoliticsDMContextReady(String contextJson)
     EndIf
 
     Core.DebugMsg("Politics: Sending DM request (async)")
-    Int result = SkyrimNetApi.SendCustomPromptToLLM("intel_political_dm", \
+    Int result = IntelEngine.SendSessionPrompt("intel_political_dm", \
         "intel_story_dm", contextJson, Self, "IntelEngine_Politics", "OnPoliticalDMResponse")
 
     If result < 0
@@ -136,6 +157,13 @@ EndFunction
 ; =============================================================================
 
 Function OnPoliticalDMResponse(String response, Int success)
+    If LegacyAutomationRetired
+        Return
+    EndIf
+    If !IntelEngine.IsCurrentSessionResponse(response)
+        Return
+    EndIf
+    response = IntelEngine.UnwrapSessionResponse(response)
     TickPending = false
     IntelEngine.ClearSystemPending("politics")
 
@@ -203,6 +231,9 @@ EndFunction
 ; — ALL moved to C++ ProcessPoliticalDMResponse. No longer needed in Papyrus.
 
 Function ProcessActiveWars(Float currentGameTime)
+    If LegacyAutomationRetired
+        Return
+    EndIf
     Int warCount = IntelEngine.GetActiveWarCount()
     If warCount == 0
         return
@@ -303,9 +334,20 @@ EndFunction
 ; =============================================================================
 
 Function Maintenance()
+    If LegacyAutomationRetired
+        Return
+    EndIf
     If !Initialized
         Initialize()
     Else
         StartScheduler()
     EndIf
+EndFunction
+
+Function RetireAutomation()
+    LegacyAutomationRetired = true
+    TickPending = false
+    UnregisterForUpdate()
+    UnregisterForUpdateGameTime()
+    IntelEngine.ClearSystemPending("politics")
 EndFunction

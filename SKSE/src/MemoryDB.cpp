@@ -74,7 +74,20 @@ namespace IntelEngine {
         m_bioSummaryCache.clear();
         m_bioRelationshipsCache.clear();
         m_cachedCurrentTime = 0.0f;
+        m_engineTimeSeconds = 0.0f;
+        m_playerName = "Player";
+        ++m_cacheGeneration;
         logger::info("MemoryDB: Caches cleared");
+    }
+
+    void MemoryDB::RefreshEngineSnapshot() {
+        auto* calendar = RE::Calendar::GetSingleton();
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        const float seconds = calendar ? calendar->GetCurrentGameTime() * 86400.0f : 0.0f;
+        const char* name = player ? player->GetDisplayFullName() : nullptr;
+        std::lock_guard lock(m_mutex);
+        m_engineTimeSeconds = seconds;
+        m_playerName = name && name[0] ? name : "Player";
     }
 
     // =========================================================================
@@ -82,9 +95,11 @@ namespace IntelEngine {
     // =========================================================================
 
     std::string MemoryDB::GetNPCBioSummary(RE::FormID formId) {
+        std::uint64_t cacheGeneration;
         // Check cache first (includes negative cache — empty string = no bio file)
         {
             std::lock_guard lock(m_mutex);
+            cacheGeneration = m_cacheGeneration;
             auto cacheIt = m_bioSummaryCache.find(formId);
             if (cacheIt != m_bioSummaryCache.end()) {
                 return cacheIt->second;
@@ -103,6 +118,7 @@ namespace IntelEngine {
 
         if (bioTemplate.empty()) {
             std::lock_guard lock(m_mutex);
+            if (cacheGeneration != m_cacheGeneration) return "";
             m_bioSummaryCache[formId] = "";
             return "";
         }
@@ -117,63 +133,21 @@ namespace IntelEngine {
         std::filesystem::path filePath;
         std::error_code ec;
 
-        // Sort comparator for save directories — uses path objects directly (no ANSI conversion)
-        auto savePathDescending = [](const std::filesystem::directory_entry& a,
-                                     const std::filesystem::directory_entry& b) {
-            return a.path().filename() > b.path().filename();
-        };
-
-        // Collect and sort save directories (reused across lookups)
-        auto getSortedSaveDirs = [&](const std::filesystem::path& savesRoot)
-            -> std::vector<std::filesystem::directory_entry> {
-            std::vector<std::filesystem::directory_entry> dirs;
-            if (!std::filesystem::exists(savesRoot, ec) || !std::filesystem::is_directory(savesRoot, ec))
-                return dirs;
-            try {
-                for (auto& entry : std::filesystem::directory_iterator(savesRoot, ec)) {
-                    if (entry.is_directory(ec)) dirs.push_back(entry);
-                }
-            } catch (const std::exception& e) {
-                logger::warn("MemoryDB: Failed to iterate saves directory: {}", e.what());
-            }
-            std::sort(dirs.begin(), dirs.end(), savePathDescending);
-            return dirs;
-        };
-
         // 1. Dynamic bio (LLM-generated evolution of the character)
         std::filesystem::path dynamicBioPath = std::filesystem::path(L"Data/SKSE/Plugins/SkyrimNet/prompts/characters/dynamic") / dynamicBioFileName;
         // 2. Static bio (authored character prompt)
         std::filesystem::path staticPath = std::filesystem::path(L"Data/SKSE/Plugins/SkyrimNet/prompts/characters") / promptFileName;
         std::filesystem::path originalPath = std::filesystem::path(L"Data/SKSE/Plugins/SkyrimNet/original_prompts/characters") / promptFileName;
 
-        // Also check save-specific dynamic bios
-        std::filesystem::path savesDir = L"Data/SKSE/Plugins/SkyrimNet/prompts/_saves";
-        auto saveDirs = getSortedSaveDirs(savesDir);
-        for (auto& saveDir : saveDirs) {
-            auto saveDynPath = saveDir.path() / L"characters" / L"dynamic" / dynamicBioFileName;
-            if (std::filesystem::exists(saveDynPath, ec)) {
-                filePath = saveDynPath;
-                break;
-            }
-        }
-
+        // The API does not expose the active campaign directory. Never enumerate
+        // other saves: their biographies belong to another campaign. SkyrimNet
+        // itself supplies the effective campaign biography in normal dialogue.
         if (filePath.empty() && std::filesystem::exists(dynamicBioPath, ec)) {
             filePath = dynamicBioPath;
         } else if (filePath.empty() && std::filesystem::exists(staticPath, ec)) {
             filePath = staticPath;
         } else if (filePath.empty() && std::filesystem::exists(originalPath, ec)) {
             filePath = originalPath;
-        }
-
-        // Last resort: save-specific static bio
-        if (filePath.empty()) {
-            for (auto& saveDir : saveDirs) {
-                auto saveBioPath = saveDir.path() / L"characters" / promptFileName;
-                if (std::filesystem::exists(saveBioPath, ec)) {
-                    filePath = saveBioPath;
-                    break;
-                }
-            }
         }
 
         // Fuzzy file fallback: template name includes a FormID suffix (e.g., "ulfric_stormcloak_584")
@@ -228,15 +202,6 @@ namespace IntelEngine {
             std::filesystem::path match = scanDir("Data/SKSE/Plugins/SkyrimNet/prompts/characters/dynamic");
             if (match.empty()) match = scanDir("Data/SKSE/Plugins/SkyrimNet/prompts/characters");
             if (match.empty()) match = scanDir("Data/SKSE/Plugins/SkyrimNet/original_prompts/characters");
-
-            // Also check save-specific directories
-            if (match.empty()) {
-                for (auto& saveDir : saveDirs) {
-                    match = scanDir(saveDir.path() / "characters" / "dynamic");
-                    if (match.empty()) match = scanDir(saveDir.path() / "characters");
-                    if (!match.empty()) break;
-                }
-            }
 
             if (!match.empty()) {
                 filePath = match;
@@ -293,7 +258,7 @@ namespace IntelEngine {
         }
 
         if (summary.empty()) {
-            logger::warn("MemoryDB: No bio summary for FormID 0x{:08X} (template: '{}', tried: '{}', '{}', and _saves/*/characters/)",
+            logger::warn("MemoryDB: No bio summary for FormID 0x{:08X} (template: '{}', tried: '{}', '{}', original prompts)",
                 formId, bioTemplate, PathToUtf8(dynamicBioPath), PathToUtf8(originalPath));
         } else {
             logger::info("MemoryDB: Bio loaded for 0x{:08X} ({}) from {}: {}...",
@@ -302,6 +267,7 @@ namespace IntelEngine {
 
         {
             std::lock_guard lock(m_mutex);
+            if (cacheGeneration != m_cacheGeneration) return "";
             m_bioSummaryCache[formId] = summary;
             m_bioRelationshipsCache[formId] = relationships;
         }
@@ -334,11 +300,11 @@ namespace IntelEngine {
     // GetFormattedMemories
     // =========================================================================
 
-    std::string MemoryDB::GetFormattedMemories(RE::FormID formId, int maxCount) {
+    std::string MemoryDB::GetFormattedMemories(RE::FormID formId, int maxCount, float currentSeconds) {
         if (!SkyrimNetAPI::GetMemoriesForActor) return "";
         try {
             auto jsonStr = SkyrimNetAPI::GetMemoriesForActor(formId, maxCount, "");
-            float currentTime = GetCurrentDBHours();
+            float currentTime = currentSeconds > 0.0f ? currentSeconds : GetCurrentDBHours();
             return FormatMemoriesFromJson(jsonStr, currentTime);
         } catch (...) {
             logger::warn("MemoryDB: GetFormattedMemories exception for 0x{:08X}", formId);
@@ -468,12 +434,12 @@ namespace IntelEngine {
     // GetRecentEventsForActor
     // =========================================================================
 
-    std::string MemoryDB::GetRecentEventsForActor(RE::FormID formId, int maxCount) {
+    std::string MemoryDB::GetRecentEventsForActor(RE::FormID formId, int maxCount, float currentSeconds) {
         if (!SkyrimNetAPI::GetRecentEvents) return "";
         try {
             auto jsonStr = SkyrimNetAPI::GetRecentEvents(
                 formId, maxCount, "direct_narration,custom_action,dialogue,dialogue_background,persistent_generic");
-            float currentTime = GetCurrentDBHours();
+            float currentTime = currentSeconds > 0.0f ? currentSeconds : GetCurrentDBHours();
             return FormatActorEventsFromJson(jsonStr, currentTime);
         } catch (...) {
             logger::warn("MemoryDB: GetRecentEventsForActor exception for 0x{:08X}", formId);
@@ -866,6 +832,9 @@ namespace IntelEngine {
     }
 
     std::unordered_set<std::string> MemoryDB::GetRecentPlayerInteractionNames(float withinHours) {
+        std::uint64_t cacheGeneration;
+        { std::lock_guard lock(m_mutex); cacheGeneration = m_cacheGeneration; }
+
         if (!SkyrimNetAPI::GetPlayerContext) return {};
         try {
             auto jsonStr = SkyrimNetAPI::GetPlayerContext(withinHours);
@@ -883,6 +852,7 @@ namespace IntelEngine {
             // Update cached current time while we have it
             if (obj.contains("currentTime")) {
                 std::lock_guard lock(m_mutex);
+                if (cacheGeneration != m_cacheGeneration) return {};
                 m_cachedCurrentTime = static_cast<float>(obj.value("currentTime", 0.0));
             }
 
@@ -896,6 +866,9 @@ namespace IntelEngine {
     }
 
     std::vector<PlayerRelationship> MemoryDB::GetPlayerRelationshipData() {
+        std::uint64_t cacheGeneration;
+        { std::lock_guard lock(m_mutex); cacheGeneration = m_cacheGeneration; }
+
         if (!SkyrimNetAPI::GetPlayerContext) return {};
         try {
             auto jsonStr = SkyrimNetAPI::GetPlayerContext(0.0f);  // 0 = all time
@@ -904,6 +877,7 @@ namespace IntelEngine {
             // Update cached current time
             if (obj.contains("currentTime")) {
                 std::lock_guard lock(m_mutex);
+                if (cacheGeneration != m_cacheGeneration) return {};
                 m_cachedCurrentTime = static_cast<float>(obj.value("currentTime", 0.0));
             }
 
@@ -1016,19 +990,17 @@ namespace IntelEngine {
     // Dialogue Safety Net Functions
     // =========================================================================
 
-    std::string MemoryDB::GetRecentDialogueForActor(RE::FormID formId, int maxExchanges) {
+    std::string MemoryDB::GetRecentDialogueForActor(RE::FormID formId, int maxExchanges, const std::string& snapshotPlayerName) {
         if (!SkyrimNetAPI::GetRecentDialogue) return "";
         try {
             auto jsonStr = SkyrimNetAPI::GetRecentDialogue(formId, maxExchanges);
             auto arr = nlohmann::json::parse(jsonStr);
             if (!arr.is_array() || arr.empty()) return "";
 
-            // Resolve player name once
-            std::string playerName = "Player";
-            auto* player = RE::PlayerCharacter::GetSingleton();
-            if (player) {
-                auto* name = player->GetDisplayFullName();
-                if (name && name[0]) playerName = name;
+            std::string playerName = snapshotPlayerName;
+            if (playerName.empty()) {
+                std::lock_guard lock(m_mutex);
+                playerName = m_playerName;
             }
 
             // Build conversation text from JSON array
@@ -1082,14 +1054,10 @@ namespace IntelEngine {
     // =========================================================================
 
     float MemoryDB::GetCurrentDBHours() {
-        // Use live game time from Calendar — this is the actual current moment.
-        // The previous approach used MAX(game_time) FROM events via GetPlayerContext,
-        // which returns the timestamp of the most recent event, NOT the current time.
-        // When events cluster together (e.g., rapid dialogue), MAX(game_time) ≈ all
-        // recent event times, making FormatRelativeTime return "just now" for everything.
-        auto* cal = RE::Calendar::GetSingleton();
-        if (cal) {
-            return cal->GetCurrentGameTime() * 86400.0f;  // days → seconds
+        // Engine time/name are captured on the main thread before worker work.
+        {
+            std::lock_guard lock(m_mutex);
+            if (m_engineTimeSeconds > 0.0f) return m_engineTimeSeconds;
         }
         // Calendar unavailable (very early init) — fall back to DB max time
         if (SkyrimNetAPI::GetPlayerContext) {

@@ -257,7 +257,9 @@ default_relations:
         }
 
         SeedDefaultRelations();
-        RecalculateRelationScores();
+        if (!PoliticalDB::GetSingleton()->HasSnapshot()) {
+            RecalculateRelationScores();
+        }
         initialized_.store(true);
 
         SnapshotCrimeGoldBaseline();

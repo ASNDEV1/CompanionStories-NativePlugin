@@ -72,6 +72,9 @@ namespace IntelEngine {
          */
         void ClearCaches();
 
+        // Main-thread capture. Formatting/query functions never touch RE objects.
+        void RefreshEngineSnapshot();
+
         // =================================================================
         // Formatted Query Functions (return LLM-ready text)
         // =================================================================
@@ -85,7 +88,7 @@ namespace IntelEngine {
          * @param maxCount Maximum memories to return
          * @return Formatted memory text, or empty string if unavailable
          */
-        std::string GetFormattedMemories(RE::FormID formId, int maxCount);
+        std::string GetFormattedMemories(RE::FormID formId, int maxCount, float currentSeconds = 0.0f);
 
         /**
          * Get recent world events formatted for LLM context.
@@ -123,7 +126,7 @@ namespace IntelEngine {
          * @param maxCount Maximum events to return
          * @return Formatted event lines, or empty string
          */
-        std::string GetRecentEventsForActor(RE::FormID formId, int maxCount);
+        std::string GetRecentEventsForActor(RE::FormID formId, int maxCount, float currentSeconds = 0.0f);
 
         /**
          * Get world knowledge entry contents applicable to an NPC.
@@ -229,7 +232,7 @@ namespace IntelEngine {
          * @param maxExchanges Maximum conversation exchanges (1 exchange = player + NPC line)
          * @return JSON-escaped conversation text, or empty string
          */
-        std::string GetRecentDialogueForActor(RE::FormID formId, int maxExchanges);
+        std::string GetRecentDialogueForActor(RE::FormID formId, int maxExchanges, const std::string& playerName = "");
 
         /**
          * Find the most recent NPC the player had a dialogue with, plus event timestamp.
@@ -299,6 +302,9 @@ namespace IntelEngine {
 
         // Cached current DB time (refreshed on GetCurrentDBHours)
         float m_cachedCurrentTime = 0.0f;
+        float m_engineTimeSeconds = 0.0f;
+        std::string m_playerName = "Player";
+        std::uint64_t m_cacheGeneration = 0;
     };
 
 }  // namespace IntelEngine

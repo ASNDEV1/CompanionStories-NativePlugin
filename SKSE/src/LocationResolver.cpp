@@ -193,7 +193,9 @@ namespace IntelEngine {
 
         RE::TESObjectREFR* foundDoor = nullptr;
 
-        sourceCell->ForEachReference([&](RE::TESObjectREFR& ref) -> RE::BSContainer::ForEachResult {
+        sourceCell->ForEachReference([&](RE::TESObjectREFR* reference) -> RE::BSContainer::ForEachResult {
+            if (!reference) return RE::BSContainer::ForEachResult::kContinue;
+            auto& ref = *reference;
             auto* baseObj = ref.GetBaseObject();
             if (!baseObj || !baseObj->Is(RE::FormType::Door)) {
                 return RE::BSContainer::ForEachResult::kContinue;
@@ -474,7 +476,9 @@ namespace IntelEngine {
 
             RE::TESObjectREFR* bestRef = nullptr;
 
-            targetCell->ForEachReference([&](RE::TESObjectREFR& ref) -> RE::BSContainer::ForEachResult {
+            targetCell->ForEachReference([&](RE::TESObjectREFR* reference) -> RE::BSContainer::ForEachResult {
+            if (!reference) return RE::BSContainer::ForEachResult::kContinue;
+            auto& ref = *reference;
                 if (ref.IsDisabled()) {
                     return RE::BSContainer::ForEachResult::kContinue;
                 }
@@ -894,7 +898,9 @@ namespace IntelEngine {
         float nearestDist = FLT_MAX;
         auto actorPos = actor->GetPosition();
 
-        cell->ForEachReference([&](RE::TESObjectREFR& ref) -> RE::BSContainer::ForEachResult {
+        cell->ForEachReference([&](RE::TESObjectREFR* reference) -> RE::BSContainer::ForEachResult {
+            if (!reference) return RE::BSContainer::ForEachResult::kContinue;
+            auto& ref = *reference;
             if (ref.IsDisabled()) return RE::BSContainer::ForEachResult::kContinue;
 
             if (analyzer->IsBedFurniture(&ref)) {
@@ -1005,7 +1011,9 @@ namespace IntelEngine {
         auto scanCell = [&](RE::TESObjectCELL* cell,
                            const std::vector<std::string>& keywords) -> RE::TESObjectREFR* {
             std::vector<WaterCandidate> candidates;
-            cell->ForEachReference([&](RE::TESObjectREFR& ref) -> RE::BSContainer::ForEachResult {
+            cell->ForEachReference([&](RE::TESObjectREFR* reference) -> RE::BSContainer::ForEachResult {
+            if (!reference) return RE::BSContainer::ForEachResult::kContinue;
+            auto& ref = *reference;
                 if (ref.IsDisabled() || ref.IsDeleted())
                     return RE::BSContainer::ForEachResult::kContinue;
                 if (matchesKeywords(ref, keywords)) {
@@ -1070,7 +1078,9 @@ namespace IntelEngine {
         for (auto* cell : dataHandler->interiorCells) {
             if (!cell) continue;
 
-            cell->ForEachReference([&](RE::TESObjectREFR& ref) -> RE::BSContainer::ForEachResult {
+            cell->ForEachReference([&](RE::TESObjectREFR* reference) -> RE::BSContainer::ForEachResult {
+            if (!reference) return RE::BSContainer::ForEachResult::kContinue;
+            auto& ref = *reference;
                 if (ref.IsDisabled()) return RE::BSContainer::ForEachResult::kContinue;
                 if (!analyzer->IsBedFurniture(&ref)) return RE::BSContainer::ForEachResult::kContinue;
 
@@ -1339,7 +1349,9 @@ namespace IntelEngine {
         int noLinked = 0;
         int interiorDest = 0;
         int noDest = 0;
-        cell->ForEachReference([&](RE::TESObjectREFR& ref) -> RE::BSContainer::ForEachResult {
+        cell->ForEachReference([&](RE::TESObjectREFR* reference) -> RE::BSContainer::ForEachResult {
+            if (!reference) return RE::BSContainer::ForEachResult::kContinue;
+            auto& ref = *reference;
             auto* baseObj = ref.GetBaseObject();
             if (!baseObj || !baseObj->Is(RE::FormType::Door) || ref.IsDisabled())
                 return RE::BSContainer::ForEachResult::kContinue;
@@ -1425,7 +1437,9 @@ namespace IntelEngine {
         // Multi-hop: door leads to another interior that HAS an exterior door
         // (modded homes with porches, entryways, or multi-room layouts)
         RE::TESObjectREFR* bestHopDoor = nullptr;
-        cell->ForEachReference([&](RE::TESObjectREFR& ref) -> RE::BSContainer::ForEachResult {
+        cell->ForEachReference([&](RE::TESObjectREFR* reference) -> RE::BSContainer::ForEachResult {
+            if (!reference) return RE::BSContainer::ForEachResult::kContinue;
+            auto& ref = *reference;
             auto* baseObj = ref.GetBaseObject();
             if (!baseObj || !baseObj->Is(RE::FormType::Door) || ref.IsDisabled())
                 return RE::BSContainer::ForEachResult::kContinue;

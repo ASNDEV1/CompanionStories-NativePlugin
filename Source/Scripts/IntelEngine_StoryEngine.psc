@@ -18,6 +18,8 @@ Scriptname IntelEngine_StoryEngine extends Quest
 ; - quest: NPC requests help clearing enemies (courier or guide delivery)
 ; =============================================================================
 
+Bool Property LegacyAutomationRetired = false Auto Hidden
+
 ; === Properties ===
 IntelEngine_Core Property Core Auto
 IntelEngine_Schedule Property Schedule Auto
@@ -144,6 +146,7 @@ Float Property TELEPORT_OFFSET_EXTERIOR = 3500.0 AutoReadOnly
 
 ; === Quest Sub-Type State ===
 String Property QuestSubType = "" Auto Hidden              ; "combat", "rescue", "find_item"
+ObjectReference Property QuestVictimOrigin = None Auto Hidden
 Actor Property QuestVictimNPC = None Auto Hidden           ; Real named NPC (rescue)
 ObjectReference Property QuestItemChest = None Auto Hidden ; Spawned chest (find_item)
 String Property QuestVictimName = "" Auto Hidden           ; Display name for narration
@@ -207,6 +210,9 @@ Int Property QUEST_OBJECTIVE_ID = 0 AutoReadOnly
 ; =============================================================================
 
 Function StartScheduler()
+    If LegacyAutomationRetired
+        Return
+    EndIf
     ; StoryEngine owns the shared game-time timer for ALL systems (Story, NPC, Politics).
     ; Always register the timer even if Story DM is disabled — other systems may be active.
     ; Each system self-gates via its own enabled check.
@@ -263,233 +269,15 @@ Function SyncHoldRestrictionPolicies()
 EndFunction
 
 Function RestartMonitoring()
-    ; Self-heal Core property if None (old saves where property wasn't in ESP)
-    If Core == None
-        Quest q = Self as Quest
-        Core = q as IntelEngine_Core
-        If Core != None
-            Debug.Trace("[IntelEngine] StoryEngine: recovered Core property via cast")
-        EndIf
-    EndIf
-    ClearPending()
-    NPCTickPending = false
-
-    ; Initialize tick timestamp so the real-time backup can fire on first interval
-    LastStoryTickTime = Utility.GetCurrentGameTime()
-
-    ; Save migration: new properties default to type-zero on old saves
-    If NPCTickIntervalHours == 0.0
-        NPCTickEnabled = true
-        NPCTickIntervalHours = 1.5
-        Core.DebugMsg("Story: NPC Social properties initialized (save migration)")
-    EndIf
-
-    ; Warm C++ volatile state from StorageUtil (C++ side is empty after game load)
-    WarmCooldownMirror()
-    WarmStoryTypeCounts()
-
-    ; Repair real-time timers carried over from a prior Skyrim session.
-    ClearStaleRealTimeTimers()
-
-    SyncHoldRestrictionPolicies()
-
-    ; Re-push active quest state to C++ (singleton resets on game load)
-    If QuestActive && QuestLocationName != ""
-        String giverName = ""
-        If QuestGiver != None
-            giverName = QuestGiver.GetDisplayName()
-        EndIf
-        IntelEngine.NotifyQuestActive(QuestLocationName, QuestSubType, QuestEnemyType, \
-            giverName, QuestBriefing, QuestVictimName, QuestItemName, QuestAlliedFaction)
-        Core.DebugMsg("Story: re-pushed quest state to C++ decorator")
-    EndIf
-
-    ; Sync auto bio settings to C++ DialogueTracker
-    IntelEngine.SetAutoBioEnabled(AutoBioEnabled)
-    IntelEngine.SetAutoBioThreshold(AutoBioThreshold)
-    WarmBioLineCounts()
-
-    ; Restore orphaned aggression changes from faction couriers (crash/save mid-dispatch)
-    If ActiveStoryNPC != None
-        Float origAggr = StorageUtil.GetFloatValue(ActiveStoryNPC, "Intel_OrigAggression", -1.0)
-        If origAggr >= 0.0
-            ActiveStoryNPC.SetActorValue("Aggression", origAggr)
-            StorageUtil.UnsetFloatValue(ActiveStoryNPC, "Intel_OrigAggression")
-            Core.DebugMsg("Story: restored orphaned aggression on " + ActiveStoryNPC.GetDisplayName())
-        EndIf
-    EndIf
-
-    ; Clean up NPC Social dispatch on load (packages lost, travel state unrecoverable)
-    If IsNPCStoryActive
-        Core.DebugMsg("Story: abandoning NPC Social dispatch on load")
-        CleanupNPCSocialDispatch()
-    EndIf
-
-    ; Recover quest guide walk (packages lost on load, but all state is in properties)
-    If QuestGuideActive && QuestGuideNPC != None && QuestLocation != None
-        If QuestGuideNPC.IsDead() || QuestGuideNPC.IsDisabled()
-            QuestGuideActive = false
-            QuestGuideWaiting = false
-            ActiveStoryType = ""
-            IsActive = false
-            Core.DebugMsg("Story: quest guide died/disabled on load, abandoning guide")
-        Else
-            Core.RemoveAllPackages(QuestGuideNPC, false)
-            PO3_SKSEFunctions.SetLinkedRef(QuestGuideNPC, QuestLocation, Core.IntelEngine_TravelTarget)
-            ActorUtil.AddPackageOverride(QuestGuideNPC, Core.TravelPackage_Jog, Core.PRIORITY_TRAVEL, 1)
-            Utility.Wait(0.1)
-            QuestGuideNPC.EvaluatePackage()
-            Core.DebugMsg("Story: recovered quest guide jog for " + QuestGuideNPC.GetDisplayName())
-        EndIf
-    ElseIf IsActive && ActiveStoryNPC != None
-        If ActiveStoryNPC.IsDead() || ActiveStoryNPC.IsDisabled()
-            Int deadSlot2 = Core.FindSlotByAgent(ActiveStoryNPC)
-            If deadSlot2 >= 0
-                Core.ClearSlot(deadSlot2)
-            EndIf
-            Core.RemoveAllPackages(ActiveStoryNPC, false)
-            CleanupStoryDispatch()
-        ElseIf ActiveStoryType == "ambush" || ActiveStoryType == "ambush_charge" || ActiveStoryType == "stalker" || ActiveStoryType == "ambush_combat"
-            ; Sneak/combat/charge phase can't be recovered reliably -- abandon, let NPC go home
-            ; Motivation memory persists in SkyrimNet so DM can pick them again
-            If ActiveStoryType == "ambush_combat"
-                ; Was mid-combat with essential flag -- clean up
-                ActiveStoryNPC.GetActorBase().SetEssential(false)
-                ActiveStoryNPC.StopCombat()
-                ActiveStoryNPC.SetActorValue("Aggression", 0)
-                ActiveStoryNPC.SetActorValue("Confidence", 2)
-            ElseIf ActiveStoryType == "stalker"
-                ; Sneak package gets stripped by RemoveAllPackages below
-            EndIf
-            Core.DebugMsg("Story: abandoning " + ActiveStoryType + " on load (sneak/combat/flee state lost)")
-            Int slot = Core.FindSlotByAgent(ActiveStoryNPC)
-            If slot >= 0
-                Core.ClearSlot(slot)
-            EndIf
-            Core.RemoveAllPackages(ActiveStoryNPC, false)
-            CleanupStoryDispatch()
-        Else
-            ; Story dispatches are transient ? abandon on load.
-            ; Reapplying stale packages causes NPCs to resume old travels even after
-            ; manual intervention or completion. The DM will dispatch new stories.
-            Core.DebugMsg("Story: abandoning " + ActiveStoryType + " for " + ActiveStoryNPC.GetDisplayName() + " on load")
-            Int storySlot = Core.FindSlotByAgent(ActiveStoryNPC)
-            If storySlot >= 0
-                Core.ClearSlot(storySlot)
-            EndIf
-            Core.RemoveAllPackages(ActiveStoryNPC, false)
-            CleanupStoryDispatch()
-        EndIf
-    EndIf
-
-    ; Rescue victim safety: if victim ref was lost on load, auto-expire quest
-    If QuestActive && QuestSubType == "rescue"
-        If QuestVictimNPC == None
-            Core.DebugMsg("Story: quest/rescue victim lost on load, expiring quest")
-            RemoveQuestMarker()
-            CleanupQuest()
-        ElseIf !QuestVictimFreed && QuestEnemiesSpawned
-            ; Re-apply restrained state on load (runtime state lost on save/load)
-            If QuestVictimInFurniture
-                ; Furniture victim: just keep DontMove, don't damage health
-                QuestVictimNPC.SetDontMove(true)
-                Core.DebugMsg("Story: re-applied furniture DontMove on load for " + QuestVictimNPC.GetDisplayName())
-            Else
-                ; Bleedout victim on save-load: DamageActorValue + EvaluatePackage
-                ; re-triggers the bleedout state transition. No SetDontMove — blocks anim.
-                QuestVictimNPC.SetNoBleedoutRecovery(true)
-                QuestVictimNPC.DamageActorValue("Health", QuestVictimNPC.GetActorValue("Health") + 100.0)
-                QuestVictimNPC.EvaluatePackage()
-                Core.DebugMsg("Story: re-applied victim bleedout on load for " + QuestVictimNPC.GetDisplayName())
-            EndIf
-        EndIf
-    EndIf
-
-    ; faction_battle recovery: battle schedule is lost on load (Battle.ResetState clears it).
-    ; If QuestBattleScheduled persists but the battle system was wiped, fail the quest cleanly.
-    If QuestActive && QuestBattleScheduled
-        If Core.Battle == None || (!Core.Battle.BattleScheduled && !IntelEngine.IsBattleActive())
-            Core.DebugMsg("Story: faction_battle quest — battle schedule lost on load, granting partial credit")
-            Debug.Notification("The fighting has ended before you arrived.")
-            ; Partial standing for willingness to fight
-            If QuestAlliedFaction != ""
-                IntelEngine.AdjustPlayerFactionStanding(QuestAlliedFaction, QUEST_STANDING_REWARD / 2)
-                String allyName = IntelEngine.GetFactionDisplayName(QuestAlliedFaction)
-                If allyName != ""
-                    Debug.Notification("The " + allyName + " acknowledge your intent to fight.")
-                EndIf
-            EndIf
-            RemoveQuestMarker()
-            CleanupQuest()
-        EndIf
-    EndIf
-
-    ; Release orphaned linger NPCs on load.
-    ; Package overrides (PO3 cosave) survive save/load but linked refs don't,
-    ; so lingering NPCs would be stuck sandboxing in place forever.
-    Actor player = Game.GetPlayer()
-
-    ; Legacy IntList cleanup (pre-refactor saves that stored FormIDs)
-    Int legacyCount = StorageUtil.IntListCount(player, "Intel_StoryLingerNPCs")
-    If legacyCount > 0
-        Core.DebugMsg("Story: releasing " + legacyCount + " legacy linger NPCs on load")
-        Int li = 0
-        While li < legacyCount
-            Int fid = StorageUtil.IntListGet(player, "Intel_StoryLingerNPCs", li)
-            Actor lingerNPC = Game.GetForm(fid) as Actor
-            If lingerNPC != None
-                Core.ReleaseLinger(lingerNPC)
-                StorageUtil.UnsetFloatValue(lingerNPC, "Intel_StoryLingerStart")
-            EndIf
-            li += 1
-        EndWhile
-    EndIf
-    StorageUtil.IntListClear(player, "Intel_StoryLingerNPCs")
-
-    ; Current FormList cleanup (stores Actor refs directly — no FormID round-trip)
-    Int lingerCount = StorageUtil.FormListCount(player, "Intel_StoryLingerActors")
-    If lingerCount > 0
-        Core.DebugMsg("Story: releasing " + lingerCount + " orphaned linger NPCs on load")
-        Int li2 = 0
-        While li2 < lingerCount
-            Actor lingerNPC2 = StorageUtil.FormListGet(player, "Intel_StoryLingerActors", li2) as Actor
-            If lingerNPC2 != None
-                Core.ReleaseLinger(lingerNPC2)
-                StorageUtil.UnsetFloatValue(lingerNPC2, "Intel_StoryLingerStart")
-            EndIf
-            li2 += 1
-        EndWhile
-    EndIf
-    StorageUtil.FormListClear(player, "Intel_StoryLingerActors")
-
-    ; Release orphaned road encounter NPCs on load.
-    ; Package overrides survive save/load but linked refs and AI state don't,
-    ; so NPCs get stranded with stale packages. Send them home.
-    Int encounterCount = StorageUtil.IntListCount(player, "Intel_FakeEncounterNPCs")
-    If encounterCount > 0
-        Core.DebugMsg("Story: releasing " + encounterCount + " orphaned road encounter NPCs on load")
-        Int ei = 0
-        While ei < encounterCount
-            Int efid = StorageUtil.IntListGet(player, "Intel_FakeEncounterNPCs", ei)
-            Actor encounterNPC = Game.GetForm(efid) as Actor
-            If encounterNPC != None
-                ClearRoadEncounterTravelState(encounterNPC)
-                StorageUtil.UnsetStringValue(encounterNPC, "Intel_FakeEncounterNarration")
-                StorageUtil.UnsetIntValue(encounterNPC, "Intel_FakeEncounterInteracted")
-                StorageUtil.UnsetFloatValue(encounterNPC, "Intel_FakeEncounterGreetTime")
-                StorageUtil.UnsetFloatValue(encounterNPC, "Intel_FakeEncounterTime")
-                encounterNPC.MoveToMyEditorLocation()
-            EndIf
-            ei += 1
-        EndWhile
-        StorageUtil.IntListClear(player, "Intel_FakeEncounterNPCs")
-    EndIf
-
-    StartScheduler()
+    ; Released entry point retained for old saved callers.
+    RetireAutomation()
 EndFunction
 
 ; Game-time timer -- fires for scheduling new candidates
 Event OnUpdateGameTime()
+    If LegacyAutomationRetired
+        Return
+    EndIf
     Core.DebugMsg("Story: OnUpdateGameTime fired (gameTime=" + Utility.GetCurrentGameTime() + ")")
     ; Register FIRST so the timer chain survives even if processing errors out.
     ; StoryEngine owns the game-time timer for ALL systems (shared quest).
@@ -511,6 +299,9 @@ EndEvent
 
 ; Real-time timer -- fires for arrival monitoring + linger proximity + quest monitoring
 Event OnUpdate()
+    If LegacyAutomationRetired
+        Return
+    EndIf
     ; Register FIRST so the loop survives even if processing errors out.
     ; (Same pattern as Travel.OnUpdate — timer chain must never break.)
     Bool needsRealTime = IsActive || IsNPCStoryActive || HasLingerNPCs() || QuestActive || FactionAmbushActive
@@ -591,6 +382,9 @@ EndEvent
 ; =============================================================================
 
 Function TickScheduler()
+    If LegacyAutomationRetired
+        Return
+    EndIf
     If Core == None
         Debug.Trace("[IntelEngine] TickScheduler: Core is None — aborting")
         return
@@ -703,6 +497,13 @@ Function TickScheduler()
 EndFunction
 
 Function OnStoryDMContextReady(String contextJson)
+    If LegacyAutomationRetired
+        Return
+    EndIf
+    If !IntelEngine.IsCurrentSessionResponse(contextJson)
+        Return
+    EndIf
+    contextJson = IntelEngine.UnwrapSessionResponse(contextJson)
     If contextJson == ""
         ClearPending()
         return
@@ -785,6 +586,9 @@ EndFunction
 ; =============================================================================
 
 Function TickNPCInteractions()
+    If LegacyAutomationRetired
+        Return
+    EndIf
     If !NPCTickEnabled
         return
     EndIf
@@ -818,6 +622,13 @@ Function TickNPCInteractions()
 EndFunction
 
 Function OnNPCDMContextReady(String contextJson)
+    If LegacyAutomationRetired
+        Return
+    EndIf
+    If !IntelEngine.IsCurrentSessionResponse(contextJson)
+        Return
+    EndIf
+    contextJson = IntelEngine.UnwrapSessionResponse(contextJson)
     If contextJson == ""
         NPCTickPending = false
         IntelEngine.ClearSystemPending("npcInteraction")
@@ -826,7 +637,7 @@ Function OnNPCDMContextReady(String contextJson)
     ; Inline the LLM request so we can clear NPCTickPending on failure.
     ; SendStoryLLMRequest only clears PendingStoryType (storyDM watchdog), not the
     ; npcInteraction watchdog — we'd otherwise leak pending state for ~1h on failure.
-    Int result = SkyrimNetApi.SendCustomPromptToLLM("intel_story_npc_dm", "intel_story_dm", contextJson, \
+    Int result = IntelEngine.SendSessionPrompt("intel_story_npc_dm", "intel_story_dm", contextJson, \
         Self, "IntelEngine_StoryEngine", "OnNPCInteractionResponse")
     If result < 0
         Debug.Trace("[IntelEngine] StoryEngine: NPC DM LLM call failed code " + result)
@@ -836,6 +647,13 @@ Function OnNPCDMContextReady(String contextJson)
 EndFunction
 
 Function OnNPCInteractionResponse(String response, Int success)
+    If LegacyAutomationRetired
+        Return
+    EndIf
+    If !IntelEngine.IsCurrentSessionResponse(response)
+        Return
+    EndIf
+    response = IntelEngine.UnwrapSessionResponse(response)
     NPCTickPending = false
     IntelEngine.ClearSystemPending("npcInteraction")
 
@@ -953,6 +771,9 @@ EndFunction
 
 Function DispatchNPCSocial(Actor npc, Actor target, String narration, String storyType)
     {Lightweight dispatch for NPC-to-NPC travel. Uses slots but does NOT touch IsActive/ActiveStoryNPC.}
+    If LegacyAutomationRetired
+        Return
+    EndIf
     Int slot = Core.FindFreeAgentSlot()
     If slot < 0
         ; No free slots -- fall back to off-screen (log already added before visibility branch)
@@ -1061,11 +882,12 @@ EndFunction
 
 Function CleanupNPCSocialDispatch()
     If NPCSocialTraveler != None
-        Int slot = Core.FindSlotByAgent(NPCSocialTraveler)
+        Int slot = Core.FindOwnedAliasForCleanup(NPCSocialTraveler)
         If slot >= 0
             Core.ClearSlot(slot)  ; handles packages, linked refs, StorageUtil keys
         Else
-            Core.RemoveAllPackages(NPCSocialTraveler, false)
+            Core.RemoveIntelPackages(NPCSocialTraveler)
+            Core.ClearLinkedRefs(NPCSocialTraveler)
         EndIf
     EndIf
     NPCSocialTraveler = None
@@ -1181,7 +1003,7 @@ Function ClearStaleRealTimeTimers()
     Float now = Utility.GetCurrentRealTime()
     Actor player = Game.GetPlayer()
 
-    If FactionAmbushStartTime > now
+    If FactionAmbushActive
         FactionAmbushStartTime = now
     EndIf
 
@@ -1192,7 +1014,7 @@ Function ClearStaleRealTimeTimers()
         Actor npc = StorageUtil.FormListGet(player, "Intel_StoryLingerActors", i) as Actor
         If npc != None
             Float t = StorageUtil.GetFloatValue(npc, "Intel_StoryLingerStart", 0.0)
-            If t > now
+            If t > 0.0
                 StorageUtil.SetFloatValue(npc, "Intel_StoryLingerStart", now)
             EndIf
         EndIf
@@ -1207,7 +1029,7 @@ Function ClearStaleRealTimeTimers()
         Actor npc = Game.GetForm(formId) as Actor
         If npc != None
             Float t = StorageUtil.GetFloatValue(npc, "Intel_FakeEncounterGreetTime", 0.0)
-            If t > now
+            If t > 0.0
                 StorageUtil.SetFloatValue(npc, "Intel_FakeEncounterGreetTime", now)
             EndIf
         EndIf
@@ -1217,11 +1039,11 @@ Function ClearStaleRealTimeTimers()
     ; Active story NPC sneak/combat timers
     If ActiveStoryNPC != None
         Float sneakStart = StorageUtil.GetFloatValue(ActiveStoryNPC, "Intel_SneakStartTime", 0.0)
-        If sneakStart > now
+        If sneakStart > 0.0
             StorageUtil.SetFloatValue(ActiveStoryNPC, "Intel_SneakStartTime", now)
         EndIf
         Float combatStart = StorageUtil.GetFloatValue(ActiveStoryNPC, "Intel_CombatStartTime", 0.0)
-        If combatStart > now
+        If combatStart > 0.0
             StorageUtil.SetFloatValue(ActiveStoryNPC, "Intel_CombatStartTime", now)
         EndIf
     EndIf
@@ -1349,7 +1171,7 @@ EndFunction
 ; =============================================================================
 
 Function SendStoryLLMRequest(String promptName, String callbackName, String contextJson)
-    Int result = SkyrimNetApi.SendCustomPromptToLLM(promptName, "intel_story_dm", contextJson, \
+    Int result = IntelEngine.SendSessionPrompt(promptName, "intel_story_dm", contextJson, \
         Self, "IntelEngine_StoryEngine", callbackName)
     If result < 0
         Debug.Trace("[IntelEngine] StoryEngine: LLM call failed (" + promptName + ") code " + result)
@@ -1362,6 +1184,13 @@ EndFunction
 ; =============================================================================
 
 Function OnDungeonMasterResponse(String response, Int success)
+    If LegacyAutomationRetired
+        Return
+    EndIf
+    If !IntelEngine.IsCurrentSessionResponse(response)
+        Return
+    EndIf
+    response = IntelEngine.UnwrapSessionResponse(response)
     ClearPending()
 
     If success != 1
@@ -1671,6 +1500,9 @@ EndFunction
 ; =============================================================================
 
 Function DispatchToTarget(Actor npc, Actor target, String narration, String slotTaskType)
+    If LegacyAutomationRetired
+        Return
+    EndIf
     Actor player = Game.GetPlayer()
 
     ; === Player home knocking prompt ===
@@ -1773,6 +1605,10 @@ EndFunction
 ; so all abort checks (danger zone, blocked location, player-in-combat,
 ; player-home restrictions) run identically to the 3s poll's path.
 Function OnProximityArrived(String slotStr)
+    Int receiptSlot = IntelEngine.ConsumeProximityReceipt(slotStr)
+    If receiptSlot < 0 || LegacyAutomationRetired
+        Return
+    EndIf
     If !IsActive
         Return
     EndIf
@@ -1806,6 +1642,9 @@ EndFunction
 ; =============================================================================
 
 Function PlaceRoadEncounter(Actor npc, String narration, String destination)
+    If LegacyAutomationRetired
+        Return
+    EndIf
     Actor player = Game.GetPlayer()
     Cell playerCell = player.GetParentCell()
 
@@ -2672,6 +2511,9 @@ EndFunction
 ; =============================================================================
 
 Function HandleAmbushStalkerDispatch(Actor npc, String narration, String response, String storyType)
+    If LegacyAutomationRetired
+        Return
+    EndIf
     String senderName = ExtractJsonField(response, "sender")
     String playerName = Game.GetPlayer().GetDisplayName()
 
@@ -2725,6 +2567,9 @@ EndFunction
 
 Function HandleFactionAmbushDispatch(String narration, String response)
     {Faction group ambush — spawn 3-7 hostile soldiers from a faction near the player.}
+    If LegacyAutomationRetired
+        Return
+    EndIf
     String factionId = ExtractJsonField(response, "ambushFaction")
     String countStr = ExtractJsonField(response, "ambushCount")
 
@@ -2897,7 +2742,8 @@ Function OnAmbushConfront()
     Utility.Wait(1.5)
 
     ; Make essential so they bleedout instead of dying -- gives yield a chance to fire
-    ActiveStoryNPC.GetActorBase().SetEssential(true)
+    CaptureAmbushState(ActiveStoryNPC)
+    IntelEngine.SetActorEssentialFlag(ActiveStoryNPC, true)
 
     ; Start combat -- NPC commits to the fight
     ActiveStoryNPC.SetActorValue("Confidence", 4)
@@ -2919,11 +2765,9 @@ Function CheckAmbushCombat()
     Float combatStart = StorageUtil.GetFloatValue(ActiveStoryNPC, "Intel_CombatStartTime", 0.0)
     If combatStart > 0.0 && (Utility.GetCurrentRealTime() - combatStart) > SNEAK_TIMEOUT_SECONDS && Core.ShouldReleaseLinger(ActiveStoryNPC)
         Core.DebugMsg("Story [ambush_combat]: " + ActiveStoryNPC.GetDisplayName() + " combat timed out - forcing end")
-        ActiveStoryNPC.GetActorBase().SetEssential(false)
+        RestoreAmbushState(ActiveStoryNPC)
         ActiveStoryNPC.StopCombat()
         ActiveStoryNPC.StopCombatAlarm()
-        ActiveStoryNPC.SetActorValue("Aggression", 0)
-        ActiveStoryNPC.SetActorValue("Confidence", 2)
         StorageUtil.UnsetFloatValue(ActiveStoryNPC, "Intel_CombatStartTime")
         Actor endedNPC = ActiveStoryNPC
         FinishArrivalWithLinger(endedNPC, Game.GetPlayer() as ObjectReference)
@@ -2931,7 +2775,7 @@ Function CheckAmbushCombat()
     EndIf
 
     If ActiveStoryNPC.IsDead()
-        ActiveStoryNPC.GetActorBase().SetEssential(false)
+        RestoreAmbushState(ActiveStoryNPC)
         Int slot = Core.FindSlotByAgent(ActiveStoryNPC)
         If slot >= 0
             Core.ClearSlot(slot)
@@ -2948,9 +2792,7 @@ Function CheckAmbushCombat()
 
     If !ActiveStoryNPC.IsInCombat()
         ; Combat ended naturally (player ran away, guards intervened, etc.)
-        ActiveStoryNPC.GetActorBase().SetEssential(false)
-        ActiveStoryNPC.SetActorValue("Aggression", 0)
-        ActiveStoryNPC.SetActorValue("Confidence", 2)
+        RestoreAmbushState(ActiveStoryNPC)
         Actor endedNPC = ActiveStoryNPC
         FinishArrivalWithLinger(endedNPC, Game.GetPlayer() as ObjectReference)
         return
@@ -2961,14 +2803,12 @@ Function OnAmbushYield()
     {Ambusher is beaten down and yields -- stops combat, linger for dialogue.}
     String playerName = Game.GetPlayer().GetDisplayName()
 
-    ; Remove essential -- player can now kill them if they choose
-    ActiveStoryNPC.GetActorBase().SetEssential(false)
+    ; Restore the actual pre-ambush state; pre-existing essential actors remain essential.
+    RestoreAmbushState(ActiveStoryNPC)
 
     ; Stop fighting
     ActiveStoryNPC.StopCombat()
     ActiveStoryNPC.StopCombatAlarm()
-    ActiveStoryNPC.SetActorValue("Aggression", 0)
-    ActiveStoryNPC.SetActorValue("Confidence", 1)
 
     ; Restore health so they can stand up from bleedout
     ActiveStoryNPC.RestoreActorValue("Health", 50.0)
@@ -3021,6 +2861,9 @@ EndFunction
 ; =============================================================================
 
 Function HandleQuestDispatch(Actor npc, String narration, String response)
+    If LegacyAutomationRetired
+        Return
+    EndIf
     If QuestActive
         Core.DebugMsg("Story DM: quest rejected -- one already active")
         return
@@ -3115,7 +2958,9 @@ Function HandleQuestDispatch(Actor npc, String narration, String response)
         npc = factionMember
         ; Make courier non-hostile so NPCs don't attack them on approach (e.g., Volkihar vampires)
         ; Save original aggression for restoration after task completes
-        StorageUtil.SetFloatValue(npc, "Intel_OrigAggression", npc.GetActorValue("Aggression"))
+        If StorageUtil.GetFloatValue(npc, "Intel_OrigAggression", -1.0) < 0.0
+            StorageUtil.SetFloatValue(npc, "Intel_OrigAggression", npc.GetActorValue("Aggression"))
+        EndIf
         npc.SetActorValue("Aggression", 0)
         ; Skip cooldown for faction couriers — they're generic/interchangeable soldiers.
         ; Rejecting a faction_battle because the nearest guard has a cooldown wastes a valid quest.
@@ -3256,6 +3101,13 @@ Function HandleQuestDispatch(Actor npc, String narration, String response)
     QuestSubType = questSubTypeStr
     QuestBriefing = msgContent
     QuestVictimNPC = victimActor
+    If QuestVictimNPC != None
+        CaptureVictimEssential()
+        Form markerBase = Game.GetFormFromFile(0x0000003B, "Skyrim.esm")
+        If markerBase != None
+            QuestVictimOrigin = QuestVictimNPC.PlaceAtMe(markerBase, 1, true, false)
+        EndIf
+    EndIf
     QuestVictimName = victimName
     QuestItemDesc = itemDesc
     QuestItemName = itemName
@@ -3423,8 +3275,7 @@ Function BeginQuestGuide(Actor guideNPC)
     IsActive = true
     IntelEngine.MarkSystemPending("storyDM", Utility.GetCurrentGameTime())
 
-    ; Nuke ALL overrides (SkyrimNet follow/talk packages from conversation)
-    ; so the jog package is the only one active.
+    ; Replace IntelEngine task packages while preserving follower-controller state.
     Core.DismissFollowerForTask(guideNPC)
     PO3_SKSEFunctions.SetLinkedRef(guideNPC, QuestLocation, Core.IntelEngine_TravelTarget)
     ActorUtil.AddPackageOverride(guideNPC, Core.TravelPackage_Jog, Core.PRIORITY_TRAVEL, 1)
@@ -3623,14 +3474,13 @@ Function PrePlaceQuestTargets()
         ; them home while the cell is unloaded.
         PO3_SKSEFunctions.SetLinkedRef(QuestVictimNPC, bossAnchor, Core.IntelEngine_TravelTarget)
         ActorUtil.AddPackageOverride(QuestVictimNPC, Core.SandboxNearPlayerPackage, Core.PRIORITY_TRAVEL, 1)
-        StorageUtil.SetIntValue(QuestVictimNPC, "Intel_WasEssential", QuestVictimNPC.IsEssential() as Int)
-        QuestVictimNPC.GetActorBase().SetEssential(true)
+        ApplyVictimEssential()
         QuestVictimNPC.SetNoBleedoutRecovery(true)
         ; DamageActorValue past current HP + EvaluatePackage is the pattern that
         ; reliably triggers the bleedout state + kneel anim on essential actors.
         ; This is what the committed version used — it works flawlessly when the
         ; cell is loaded, and first-3D-load re-applies for the unloaded case.
-        QuestVictimNPC.DamageActorValue("Health", QuestVictimNPC.GetActorValue("Health") + 100.0)
+        ApplyVictimBleedoutDamage()
         QuestVictimNPC.EvaluatePackage()
         IntelEngine.NotifyStoryCooldown(QuestVictimNPC, Utility.GetCurrentGameTime())
         Core.DebugMsg("Story [quest/rescue]: victim " + QuestVictimNPC.GetDisplayName() + " placed at boss room in bleedout")
@@ -3757,7 +3607,7 @@ Function CheckQuestProximity()
                 ; activate hostiles so they spawn into a room with a downed captive.
                 If QuestSubType == "rescue" && QuestVictimNPC != None && !QuestVictimFreed && !QuestVictimInFurniture
                     QuestVictimNPC.SetNoBleedoutRecovery(true)
-                    QuestVictimNPC.DamageActorValue("Health", QuestVictimNPC.GetActorValue("Health") + 100.0)
+                    ApplyVictimBleedoutDamage()
                     QuestVictimNPC.EvaluatePackage()
                     Core.DebugMsg("Story [quest/rescue]: re-applied bleedout on first 3D load")
                 EndIf
@@ -3978,12 +3828,11 @@ Function CheckQuestProximity()
                         QuestVictimNPC.MoveTo(aheadAnchor, 0.0, 0.0, 0.0)
                         PO3_SKSEFunctions.SetLinkedRef(QuestVictimNPC, aheadAnchor, Core.IntelEngine_TravelTarget)
                         ActorUtil.AddPackageOverride(QuestVictimNPC, Core.SandboxNearPlayerPackage, Core.PRIORITY_TRAVEL, 1)
-                        StorageUtil.SetIntValue(QuestVictimNPC, "Intel_WasEssential", QuestVictimNPC.IsEssential() as Int)
-                        QuestVictimNPC.GetActorBase().SetEssential(true)
+                        ApplyVictimEssential()
                         QuestVictimNPC.SetNoBleedoutRecovery(true)
                         ; DamageActorValue + EvaluatePackage reliably triggers bleedout
                         ; state + kneel animation on essential actors.
-                        QuestVictimNPC.DamageActorValue("Health", QuestVictimNPC.GetActorValue("Health") + 100.0)
+                        ApplyVictimBleedoutDamage()
                         QuestVictimNPC.EvaluatePackage()
                         IntelEngine.NotifyStoryCooldown(QuestVictimNPC, Utility.GetCurrentGameTime())
                         ; Move marker to victim immediately
@@ -4097,10 +3946,9 @@ Function CheckQuestProximity()
                     ObjectReference usableFurn = IntelEngine.FindUsablePrisonerFurniture(QuestVictimNPC)
                     If usableFurn != None
                         ; Switch from bleedout to furniture: recover health first
-                        QuestVictimNPC.SetNoBleedoutRecovery(false)
-                        QuestVictimNPC.RestoreActorValue("Health", 500.0)
-                        QuestVictimNPC.SetRestrained(false)
-                        QuestVictimNPC.SetDontMove(false)
+                        RestoreVictimRestraints()
+                        RestoreVictimHealth()
+                        RestoreVictimRestraints()
                         QuestVictimNPC.MoveTo(usableFurn, 0.0, 0.0, 0.0)
                         usableFurn.Activate(QuestVictimNPC)
                         QuestVictimNPC.SetDontMove(true)
@@ -4113,7 +3961,7 @@ Function CheckQuestProximity()
                             Core.DebugMsg("Story [quest/rescue]: nudged victim to decorative prison prop in boss room")
                         EndIf
                         QuestVictimNPC.SetNoBleedoutRecovery(true)
-                        QuestVictimNPC.DamageActorValue("Health", QuestVictimNPC.GetActorValue("Health") + 100.0)
+                        ApplyVictimBleedoutDamage()
                         QuestVictimNPC.EvaluatePackage()
                     EndIf
                 EndIf
@@ -4124,7 +3972,7 @@ Function CheckQuestProximity()
                 Else
                     QuestVictimNPC.SetNoBleedoutRecovery(true)
                     If QuestVictimNPC.GetActorValue("Health") > 1.0
-                        QuestVictimNPC.DamageActorValue("Health", QuestVictimNPC.GetActorValue("Health") + 100.0)
+                        ApplyVictimBleedoutDamage()
                         QuestVictimNPC.EvaluatePackage()
                         Core.DebugMsg("Story [quest/rescue]: re-applied bleedout to " + QuestVictimNPC.GetDisplayName())
                     EndIf
@@ -4220,11 +4068,10 @@ Function SpawnQuestEnemies()
         PO3_SKSEFunctions.SetLinkedRef(QuestVictimNPC, victimAnchor, Core.IntelEngine_TravelTarget)
         ActorUtil.AddPackageOverride(QuestVictimNPC, Core.SandboxNearPlayerPackage, Core.PRIORITY_TRAVEL, 1)
         ; Protect victim from death — always make essential for bleedout
-        StorageUtil.SetIntValue(QuestVictimNPC, "Intel_WasEssential", QuestVictimNPC.IsEssential() as Int)
-        QuestVictimNPC.GetActorBase().SetEssential(true)
+        ApplyVictimEssential()
         ; DamageActorValue + EvaluatePackage triggers bleedout state + kneel anim on essentials.
         QuestVictimNPC.SetNoBleedoutRecovery(true)
-        QuestVictimNPC.DamageActorValue("Health", QuestVictimNPC.GetActorValue("Health") + 100.0)
+        ApplyVictimBleedoutDamage()
         QuestVictimNPC.EvaluatePackage()
         Core.DebugMsg("Story [quest/rescue]: placed victim " + QuestVictimNPC.GetDisplayName() + " in bleedout")
         ; Apply story cooldown to the victim so they can't be re-kidnapped soon
@@ -4378,18 +4225,17 @@ Function FreeQuestVictim()
     QuestVictimFreed = true
     If QuestVictimInFurniture
         ; Furniture victim: exit the furniture by moving to self
-        QuestVictimNPC.SetDontMove(false)
+        RestoreVictimRestraints()
         QuestVictimNPC.MoveTo(QuestVictimNPC)
         QuestVictimNPC.EvaluatePackage()
         Core.DebugMsg("Story [quest/rescue]: victim " + QuestVictimNPC.GetDisplayName() + " freed from furniture")
     Else
         ; Bleedout victim: unpin and recover from bleedout
-        QuestVictimNPC.SetDontMove(false)
-        QuestVictimNPC.SetNoBleedoutRecovery(false)
+        RestoreVictimRestraints()
         Core.DebugMsg("Story [quest/rescue]: victim " + QuestVictimNPC.GetDisplayName() + " freed from bleedout")
     EndIf
     ; Heal victim fully after freeing
-    QuestVictimNPC.RestoreActorValue("Health", 500.0)
+    RestoreVictimHealth()
     Core.NotifyPlayer(QuestVictimNPC.GetDisplayName() + " has been freed!")
 EndFunction
 
@@ -4437,11 +4283,7 @@ Function OnQuestComplete()
                 StorageUtil.SetStringValue(QuestVictimNPC, "Intel_RescueNarration", "was just freed from " + QuestEnemyType + " captivity by " + playerName)
             EndIf
             ; Restore essential state now (before sandbox)
-            Int wasEssential = StorageUtil.GetIntValue(QuestVictimNPC, "Intel_WasEssential", -1)
-            If wasEssential >= 0
-                QuestVictimNPC.GetActorBase().SetEssential(wasEssential as Bool)
-                StorageUtil.UnsetIntValue(QuestVictimNPC, "Intel_WasEssential")
-            EndIf
+            RestoreVictimEssential()
             ; Store rescue metadata for post-rescue death detection.
             ; CheckRescuedNPCDeaths monitors this list beyond linger release.
             If QuestGiver != None
@@ -4467,6 +4309,7 @@ Function OnQuestComplete()
             QuestVictimNPC.EvaluatePackage()
             StartStoryLinger(QuestVictimNPC)
             ; Mark victim as handled — CleanupQuest won't teleport them
+            CleanupVictimOrigin()
             QuestVictimNPC = None
         EndIf
     ElseIf QuestSubType == "find_item"
@@ -4618,7 +4461,7 @@ Function CleanupQuest()
     ; If the courier is still traveling to the player (IsActive + ActiveStoryType == "quest"),
     ; clear their slot and dispatch so they don't keep searching for a cancelled quest.
     If IsActive && ActiveStoryNPC != None && ActiveStoryType == "quest"
-        Int courierSlot = Core.FindSlotByAgent(ActiveStoryNPC)
+        Int courierSlot = Core.FindOwnedAliasForCleanup(ActiveStoryNPC)
         If courierSlot >= 0
             Core.ClearSlot(courierSlot)
         EndIf
@@ -4627,7 +4470,7 @@ Function CleanupQuest()
         ; Instead, manually clear the dispatch state.
         ; Restore courier aggression if it was modified
         Float origAggr = StorageUtil.GetFloatValue(ActiveStoryNPC, "Intel_OrigAggression", -1.0)
-        If origAggr >= 0.0
+        If origAggr >= 0.0 && ActiveStoryNPC.GetActorValue("Aggression") == 0.0
             ActiveStoryNPC.SetActorValue("Aggression", origAggr)
             StorageUtil.UnsetFloatValue(ActiveStoryNPC, "Intel_OrigAggression")
         EndIf
@@ -4650,7 +4493,7 @@ Function CleanupQuest()
     EndIf
 
     If QuestGuideNPC != None
-        Int slot = Core.FindSlotByAgent(QuestGuideNPC)
+        Int slot = Core.FindOwnedAliasForCleanup(QuestGuideNPC)
         If slot >= 0
             Core.ClearSlot(slot)
         EndIf
@@ -4659,30 +4502,39 @@ Function CleanupQuest()
 
     ; === Rescue victim cleanup ===
     If QuestVictimNPC != None
-        If QuestVictimInFurniture
-            QuestVictimNPC.MoveTo(QuestVictimNPC)  ; exit furniture idle
+        Bool unresolvedLegacyVictim = LegacyAutomationRetired && StorageUtil.GetIntValue(QuestVictimNPC, "Intel_VictimStateOwned", 0) != 1
+        If unresolvedLegacyVictim
+            ; Upstream did not capture movement, bleedout or health originals.
+            ; Keep the released actor reference and original essential key readable.
+            ; Removing protection at forced zero HP could kill this real NPC.
+            Core.RemoveIntelPackages(QuestVictimNPC)
+            Core.ClearLinkedRefs(QuestVictimNPC)
+            Core.DebugMsg("Retired rescue retains unresolved actor state for " + QuestVictimNPC.GetDisplayName())
+        Else
+            If QuestVictimInFurniture
+                QuestVictimNPC.MoveTo(QuestVictimNPC)  ; exit furniture idle
+            EndIf
+            RestoreVictimRestraints()
+            RestoreVictimHealth()
+            StorageUtil.UnsetStringValue(QuestVictimNPC, "Intel_RescueNarration")
+            Core.RemoveIntelPackages(QuestVictimNPC, false)
+            Core.ClearLinkedRefs(QuestVictimNPC)
+            ; Restore original essential state
+            RestoreVictimEssential()
+            ; If victim was NOT freed by the player, they "escaped"
+            If !QuestVictimFreed && !LegacyAutomationRetired
+                Core.InjectFact(QuestVictimNPC, "managed to escape " + QuestEnemyType + " captivity at " + QuestLocationName + " on my own")
+            EndIf
+            If QuestVictimOrigin != None
+                QuestVictimNPC.MoveTo(QuestVictimOrigin)
+            EndIf
+            ; Force AI re-evaluation so NPCs re-engage furniture (e.g., Jarl sits on throne)
+            QuestVictimNPC.EvaluatePackage()
+            QuestVictimNPC = None
         EndIf
-        QuestVictimNPC.SetRestrained(false)
-        QuestVictimNPC.SetDontMove(false)
-        QuestVictimNPC.SetNoBleedoutRecovery(false)
-        QuestVictimNPC.RestoreActorValue("Health", 500.0)
-        StorageUtil.UnsetStringValue(QuestVictimNPC, "Intel_RescueNarration")
-        Core.RemoveAllPackages(QuestVictimNPC, false)
-        ; Restore original essential state
-        Int wasEssential = StorageUtil.GetIntValue(QuestVictimNPC, "Intel_WasEssential", -1)
-        If wasEssential >= 0
-            QuestVictimNPC.GetActorBase().SetEssential(wasEssential as Bool)
-            StorageUtil.UnsetIntValue(QuestVictimNPC, "Intel_WasEssential")
-        EndIf
-        ; If victim was NOT freed by the player, they "escaped"
-        If !QuestVictimFreed
-            Core.InjectFact(QuestVictimNPC, "managed to escape " + QuestEnemyType + " captivity at " + QuestLocationName + " on my own")
-        EndIf
-        QuestVictimNPC.MoveToMyEditorLocation()
-        ; Force AI re-evaluation so NPCs re-engage furniture (e.g., Jarl sits on throne)
-        QuestVictimNPC.EvaluatePackage()
-        QuestVictimNPC = None
     EndIf
+
+    CleanupVictimOrigin()
 
     ; === Find item chest cleanup ===
     If QuestItemChest != None
@@ -4894,7 +4746,7 @@ Function CleanupStoryDispatch()
     If ActiveStoryType == "quest" || ActiveStoryType == "quest_guide"
         If QuestActive
             ; Notify quest giver that the quest fell through (courier aborted, stuck, etc.)
-            If QuestGiver != None && QuestEnemyType != "" && QuestLocationName != ""
+            If !LegacyAutomationRetired && QuestGiver != None && QuestEnemyType != "" && QuestLocationName != ""
                 Core.InjectFact(QuestGiver, "never heard back about the " + QuestEnemyType + " threat at " + QuestLocationName + " — the request seems to have fallen through")
             EndIf
             CleanupQuest()
@@ -4902,9 +4754,10 @@ Function CleanupStoryDispatch()
     EndIf
 
     If ActiveStoryNPC != None
+        RestoreAmbushState(ActiveStoryNPC)
         ; Restore original aggression if it was lowered for courier approach
         Float origAggr = StorageUtil.GetFloatValue(ActiveStoryNPC, "Intel_OrigAggression", -1.0)
-        If origAggr >= 0.0
+        If origAggr >= 0.0 && ActiveStoryNPC.GetActorValue("Aggression") == 0.0
             ActiveStoryNPC.SetActorValue("Aggression", origAggr)
             StorageUtil.UnsetFloatValue(ActiveStoryNPC, "Intel_OrigAggression")
         EndIf
@@ -4977,6 +4830,9 @@ EndFunction
 ; =============================================================================
 
 Function AddRecentStoryEvent(String summary)
+    If LegacyAutomationRetired
+        Return
+    EndIf
     Actor player = Game.GetPlayer()
     StorageUtil.StringListAdd(player, "Intel_RecentStoryEvents", summary)
     While StorageUtil.StringListCount(player, "Intel_RecentStoryEvents") > 8
@@ -4986,6 +4842,9 @@ EndFunction
 
 Function AddNPCSocialLog(String eventType, String npc1Name, String npc2Name, String narration, Actor sourceNPC = None, String detail = "")
     {Store structured NPC social interaction for dashboard display. Parallel StringLists, last 5.}
+    If LegacyAutomationRetired
+        Return
+    EndIf
     Actor player = Game.GetPlayer()
     ; Get hold name from the NPC who initiated the interaction (not the player)
     String locName = ""
@@ -5116,4 +4975,179 @@ EndFunction
 
 String Function ExtractJsonField(String json, String fieldName)
     return IntelEngine.StoryResponseGetField(json, fieldName)
+EndFunction
+
+; State leases preserve first-observed values through retries and save/load.
+Function CaptureAmbushState(Actor npc)
+    If StorageUtil.GetIntValue(npc, "Intel_AmbushStateOwned", 0) != 1
+        StorageUtil.SetIntValue(npc, "Intel_AmbushWasEssential", IntelEngine.GetActorEssentialFlag(npc) as Int)
+        StorageUtil.SetFloatValue(npc, "Intel_AmbushConfidence", npc.GetActorValue("Confidence"))
+        StorageUtil.SetIntValue(npc, "Intel_AmbushStateOwned", 1)
+    EndIf
+EndFunction
+
+Function RestoreAmbushState(Actor npc)
+    If npc == None || StorageUtil.GetIntValue(npc, "Intel_AmbushStateOwned", 0) != 1
+        Return
+    EndIf
+    ; Don't clobber another owner's subsequent confidence change.
+    If npc.GetActorValue("Confidence") == 4.0
+        npc.SetActorValue("Confidence", StorageUtil.GetFloatValue(npc, "Intel_AmbushConfidence"))
+    EndIf
+    If IntelEngine.GetActorEssentialFlag(npc)
+        IntelEngine.SetActorEssentialFlag(npc, StorageUtil.GetIntValue(npc, "Intel_AmbushWasEssential") as Bool)
+    EndIf
+    StorageUtil.UnsetIntValue(npc, "Intel_AmbushStateOwned")
+    StorageUtil.UnsetIntValue(npc, "Intel_AmbushWasEssential")
+    StorageUtil.UnsetFloatValue(npc, "Intel_AmbushConfidence")
+EndFunction
+
+Function CaptureVictimEssential()
+    If StorageUtil.GetIntValue(QuestVictimNPC, "Intel_VictimStateOwned", 0) != 1
+        ; Legacy base-state readers remain distinct from new per-reference leases.
+        StorageUtil.SetIntValue(QuestVictimNPC, "Intel_VictimRefEssential", IntelEngine.GetActorEssentialFlag(QuestVictimNPC) as Int)
+        StorageUtil.SetIntValue(QuestVictimNPC, "Intel_VictimDontMove", IntelEngine.GetActorDontMove(QuestVictimNPC) as Int)
+        StorageUtil.SetIntValue(QuestVictimNPC, "Intel_VictimRestrained", IntelEngine.GetActorRestrained(QuestVictimNPC) as Int)
+        StorageUtil.SetIntValue(QuestVictimNPC, "Intel_VictimNoRecovery", IntelEngine.GetActorNoBleedoutRecovery(QuestVictimNPC) as Int)
+        StorageUtil.SetFloatValue(QuestVictimNPC, "Intel_VictimHealth", QuestVictimNPC.GetActorValue("Health"))
+        StorageUtil.SetIntValue(QuestVictimNPC, "Intel_VictimStateOwned", 1)
+    EndIf
+EndFunction
+
+Function RestoreVictimEssential()
+    If StorageUtil.GetIntValue(QuestVictimNPC, "Intel_VictimStateOwned", 0) == 1
+        If IntelEngine.GetActorEssentialFlag(QuestVictimNPC)
+            IntelEngine.SetActorEssentialFlag(QuestVictimNPC, StorageUtil.GetIntValue(QuestVictimNPC, "Intel_VictimRefEssential") as Bool)
+        EndIf
+        StorageUtil.UnsetIntValue(QuestVictimNPC, "Intel_VictimStateOwned")
+        StorageUtil.UnsetIntValue(QuestVictimNPC, "Intel_VictimRefEssential")
+        StorageUtil.UnsetIntValue(QuestVictimNPC, "Intel_VictimDontMove")
+        StorageUtil.UnsetIntValue(QuestVictimNPC, "Intel_VictimRestrained")
+        StorageUtil.UnsetIntValue(QuestVictimNPC, "Intel_VictimNoRecovery")
+        StorageUtil.UnsetFloatValue(QuestVictimNPC, "Intel_VictimHealth")
+        StorageUtil.UnsetFloatValue(QuestVictimNPC, "Intel_VictimAppliedHealth")
+    EndIf
+    ; Old code recorded the base flag, so only its recorded base mutation can
+    ; be restored here. Unknown prior essential state is never assumed false.
+    Int wasEssential = StorageUtil.GetIntValue(QuestVictimNPC, "Intel_WasEssential", -1)
+    If wasEssential >= 0
+        QuestVictimNPC.GetActorBase().SetEssential(wasEssential as Bool)
+        StorageUtil.UnsetIntValue(QuestVictimNPC, "Intel_WasEssential")
+    EndIf
+EndFunction
+
+Function RestoreVictimRestraints()
+    If StorageUtil.GetIntValue(QuestVictimNPC, "Intel_VictimStateOwned", 0) == 1
+        If IntelEngine.GetActorDontMove(QuestVictimNPC)
+            QuestVictimNPC.SetDontMove(StorageUtil.GetIntValue(QuestVictimNPC, "Intel_VictimDontMove") as Bool)
+        EndIf
+        If IntelEngine.GetActorNoBleedoutRecovery(QuestVictimNPC)
+            QuestVictimNPC.SetNoBleedoutRecovery(StorageUtil.GetIntValue(QuestVictimNPC, "Intel_VictimNoRecovery") as Bool)
+        EndIf
+    EndIf
+EndFunction
+
+Function RestoreVictimHealth()
+    Float original = StorageUtil.GetFloatValue(QuestVictimNPC, "Intel_VictimHealth", -1.0)
+    Float current = QuestVictimNPC.GetActorValue("Health")
+    Float imposed = StorageUtil.GetFloatValue(QuestVictimNPC, "Intel_VictimAppliedHealth", -999999.0)
+    If original > current && current == imposed && !QuestVictimNPC.IsDead()
+        QuestVictimNPC.RestoreActorValue("Health", original - current)
+    EndIf
+EndFunction
+
+Function CleanupVictimOrigin()
+    If QuestVictimOrigin != None
+        QuestVictimOrigin.Disable()
+        QuestVictimOrigin.Delete()
+        QuestVictimOrigin = None
+    EndIf
+EndFunction
+
+Function ApplyVictimEssential()
+    If StorageUtil.GetIntValue(QuestVictimNPC, "Intel_VictimStateOwned", 0) == 1
+        IntelEngine.SetActorEssentialFlag(QuestVictimNPC, true)
+    EndIf
+EndFunction
+
+Function ApplyVictimBleedoutDamage()
+    QuestVictimNPC.DamageActorValue("Health", QuestVictimNPC.GetActorValue("Health") + 100.0)
+    If StorageUtil.GetIntValue(QuestVictimNPC, "Intel_VictimStateOwned", 0) == 1
+        StorageUtil.SetFloatValue(QuestVictimNPC, "Intel_VictimAppliedHealth", QuestVictimNPC.GetActorValue("Health"))
+    EndIf
+EndFunction
+
+Function RetireAutomation()
+    If Core == None
+        Quest ownerQuest = Self as Quest
+        Core = ownerQuest as IntelEngine_Core
+    EndIf
+    If Core == None
+        Debug.Trace("IntelEngine retirement: Core unavailable; preserving tracked state")
+        Return
+    EndIf
+
+    ; User-authorized retirement keeps saved identities and readers; release
+    ; only tracked runtime work, without narrating outcomes.
+    LegacyAutomationRetired = true
+    StopScheduler()
+    ClearPending()
+    NPCTickPending = false
+    IntelEngine.ClearSystemPending("storyDM")
+    IntelEngine.ClearSystemPending("npcInteraction")
+    Actor retiredActor = ActiveStoryNPC
+    If retiredActor != None
+        RestoreAmbushState(retiredActor)
+        Int retiredSlot = Core.FindOwnedAliasForCleanup(retiredActor)
+        If retiredSlot >= 0
+            Core.ClearSlot(retiredSlot)
+        EndIf
+        Core.RemoveIntelPackages(retiredActor)
+        Core.ClearLinkedRefs(retiredActor)
+    EndIf
+    CleanupNPCSocialDispatch()
+
+    Actor player = Game.GetPlayer()
+    Int spawnedCount = StorageUtil.FormListCount(player, "Intel_QuestSpawnedNPCs")
+    Int i = 0
+    While i < spawnedCount
+        Actor spawned = StorageUtil.FormListGet(player, "Intel_QuestSpawnedNPCs", i) as Actor
+        If spawned != None
+            spawned.DisableNoWait()
+            spawned.Delete()
+        EndIf
+        i += 1
+    EndWhile
+    CleanupQuest()
+    CleanupStoryDispatch()
+
+    i = 0
+    If FactionAmbushActors != None
+        While i < FactionAmbushActors.Length
+            Actor spawned = FactionAmbushActors[i]
+            If spawned != None
+                spawned.DisableNoWait()
+                spawned.Delete()
+                FactionAmbushActors[i] = None
+            EndIf
+            i += 1
+        EndWhile
+    EndIf
+    FactionAmbushActive = false
+    FactionAmbushCount = 0
+    StorageUtil.UnsetStringValue(player, "Intel_FactionAmbushFaction")
+
+    ; FormList references are save-resolved. Old integer-only actor lists have no
+    ; reliable ownership mapping after load-order changes, so never act on them.
+    i = StorageUtil.FormListCount(player, "Intel_StoryLingerActors") - 1
+    While i >= 0
+        Actor linger = StorageUtil.FormListGet(player, "Intel_StoryLingerActors", i) as Actor
+        If linger != None
+            Core.RemoveIntelPackages(linger)
+            Core.ClearLinkedRefs(linger)
+        EndIf
+        i -= 1
+    EndWhile
+    StorageUtil.FormListClear(player, "Intel_StoryLingerActors")
+    StopScheduler()
 EndFunction

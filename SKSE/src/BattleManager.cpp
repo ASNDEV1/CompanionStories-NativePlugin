@@ -13,6 +13,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <climits>
+#include <stdexcept>
 
 namespace IntelEngine {
 
@@ -78,7 +80,7 @@ namespace IntelEngine {
             std::lock_guard<std::mutex> cLock(cleanupMutex_);
             cleanupFormIds_.clear();
             for (const auto& a : activeBattle_->actors) {
-                cleanupFormIds_.push_back(a.formId);
+                if (a.ownedSpawn) cleanupFormIds_.push_back(a.formId);
             }
             logger::info("[BattleManager] Battle {} ended: result={}, victor={}, {} actors moved to cleanup list",
                          battleId, result, victor, cleanupFormIds_.size());
@@ -101,7 +103,7 @@ namespace IntelEngine {
     // Actor Tracking
     // =========================================================================
 
-    bool BattleManager::RegisterActor(RE::Actor* actor, const std::string& factionId, int tier) {
+    bool BattleManager::RegisterActor(RE::Actor* actor, const std::string& factionId, int tier, bool ownedSpawn) {
         std::lock_guard<std::mutex> lock(mutex_);
 
         if (!activeBattle_.has_value()) return false;
@@ -112,6 +114,7 @@ namespace IntelEngine {
         ba.factionId = factionId;
         ba.tier = std::clamp(tier, 0, 2);
         ba.alive = true;
+        ba.ownedSpawn = ownedSpawn;
 
         activeBattle_->actors.push_back(ba);
         return true;
@@ -363,14 +366,8 @@ namespace IntelEngine {
         auto* player = RE::PlayerCharacter::GetSingleton();
         if (!player) return;
 
-        // Clear bounty from all holds
-        for (auto fid : kCrimeFactionIds) {
-            auto* faction = RE::TESForm::LookupByID<RE::TESFaction>(fid);
-            if (faction && (faction->GetCrimeGold() > 0)) {
-                faction->SetCrimeGold(0);
-                faction->SetCrimeGoldViolent(0);
-            }
-        }
+        // Bounty prevention belongs to spawned battle actors (SnapshotBounties).
+        // Unrelated player crime gold and unaffiliated actors are not battle state.
 
         // Check if player has positive standing with the allied faction.
         // If yes, wipe assault memory from any hostile allied NPC.
@@ -395,6 +392,13 @@ namespace IntelEngine {
             if (!actor || actor == player || actor->IsDead()) return false;
             if (!actor->IsHostileToActor(player)) return false;
 
+            // Only generated battle soldiers are ours to pacify. Never clear the
+            // assault state of arbitrary guards merely sharing a political faction.
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (!activeBattle_ || std::none_of(activeBattle_->actors.begin(), activeBattle_->actors.end(),
+                    [&](const BattleActor& a) { return a.ownedSpawn && a.formId == actor->GetFormID(); })) return false;
+            }
             // Only forgive allies — enemy soldiers SHOULD attack the player
             auto npcFaction = fp->GetNPCFactionId(actor);
             if (npcFaction != playerSide) return false;
@@ -1170,13 +1174,14 @@ namespace IntelEngine {
                 std::lock_guard<std::mutex> cLock(cleanupMutex_);
                 if (cleanupFormIds_.empty()) {
                     for (const auto& a : activeBattle_->actors) {
-                        cleanupFormIds_.push_back(a.formId);
+                        if (a.ownedSpawn) cleanupFormIds_.push_back(a.formId);
                     }
                 }
             }
             activeBattle_.reset();
         }
         suppressBattleBounty_ = false;
+        RestoreEnlistedGuards();
         logger::info("Battle: State reset");
     }
 
@@ -1188,7 +1193,8 @@ namespace IntelEngine {
         // Crime faction removal from guards is unnecessary — the player's own crime
         // factions are already removed, so no bounty accrues regardless.
         auto* fp = FactionPolitics::GetSingleton();
-        modifiedGuardFormIds_.clear();
+        RestoreEnlistedGuards();
+        std::lock_guard<std::mutex> ownershipLock(ownershipMutex_);
         float px = player->GetPositionX();
         float py = player->GetPositionY();
         int count = 0;
@@ -1202,6 +1208,7 @@ namespace IntelEngine {
             float dy = actor->GetPositionY() - py;
             if ((dx * dx + dy * dy) > 9000000.f) return false;  // 3000^2
 
+            guardFactionLeases_.push_back({actor->GetFormID(), battleFaction->GetFormID(), actor->GetFactionRank(battleFaction, false), 0});
             actor->AddToFaction(battleFaction, 0);
             modifiedGuardFormIds_.push_back(actor->GetFormID());
             count++;
@@ -1213,67 +1220,51 @@ namespace IntelEngine {
     }
 
     void BattleManager::RestoreEnlistedGuards() {
-        // Remove guards from battle factions and clear any combat against the player.
-        auto [battleFactionA, battleFactionB] = ResolveBattleFactions();
-
-        int restored = 0;
-        for (auto fid : modifiedGuardFormIds_) {
-            auto* actor = RE::TESForm::LookupByID<RE::Actor>(fid);
-            if (actor) {
-                if (battleFactionA) actor->AddToFaction(battleFactionA, -1);
-                if (battleFactionB) actor->AddToFaction(battleFactionB, -1);
-                if (actor->IsInCombat()) {
-                    actor->StopCombat();
-                }
-                restored++;
+        std::lock_guard<std::mutex> lock(ownershipMutex_);
+        for (const auto& lease : guardFactionLeases_) {
+            auto* actor = RE::TESForm::LookupByID<RE::Actor>(lease.actor);
+            auto* faction = RE::TESForm::LookupByID<RE::TESFaction>(lease.faction);
+            if (actor && faction && actor->GetFactionRank(faction, false) == lease.appliedRank) {
+                actor->AddToFaction(faction, static_cast<std::int8_t>(lease.rank));
             }
         }
+        guardFactionLeases_.clear();
         modifiedGuardFormIds_.clear();
-        if (restored > 0) {
-            logger::info("Battle: Restored {} guards to pre-battle state", restored);
-        }
     }
 
     void BattleManager::CleanupStaleBattleState() {
-        // Safety net — called on game load to clean up guards/player from a battle
-        // that ended while guards were unloaded or player cell-changed mid-battle.
-
-        // Restore all enlisted guards (centralized: removes battle faction, restores crime factions)
-        RestoreEnlistedGuards();
-
-        // Restore player crime factions if they were removed and never restored
-        if (playerCrimeFactionsRemoved_) {
-            RestorePlayerCrimeFactions();  // also clears residual bounty
-        }
+        // Retained compatibility entry point. Active leases belong to the loaded
+        // save and remain in force until their owning quest/battle ends.
+        if (!IsBattleActive()) RestoreEnlistedGuards();
     }
 
     void BattleManager::RemovePlayerCrimeFactions() {
         auto* player = RE::PlayerCharacter::GetSingleton();
         if (!player) return;
+        std::lock_guard<std::mutex> lock(ownershipMutex_);
+        if (playerCrimeFactionsRemoved_) return;
         for (auto fid : kCrimeFactionIds) {
-            auto* cf = RE::TESForm::LookupByID<RE::TESFaction>(fid);
-            if (cf) player->AddToFaction(cf, -1);
+            auto* faction = RE::TESForm::LookupByID<RE::TESFaction>(fid);
+            if (!faction) continue;
+            const int rank = player->GetFactionRank(faction, true);
+            if (rank < 0) continue;
+            playerCrimeLeases_.push_back({player->GetFormID(), fid, rank, -1});
+            player->AddToFaction(faction, -1);
         }
         playerCrimeFactionsRemoved_ = true;
-        logger::info("Battle: Player removed from crime factions (quest-level immunity)");
     }
 
     void BattleManager::RestorePlayerCrimeFactions() {
-        auto* player = RE::PlayerCharacter::GetSingleton();
-        if (!player) return;
-        for (auto fid : kCrimeFactionIds) {
-            auto* cf = RE::TESForm::LookupByID<RE::TESFaction>(fid);
-            if (cf) player->AddToFaction(cf, 0);
-        }
-        for (auto fid : kCrimeFactionIds) {
-            auto* faction = RE::TESForm::LookupByID<RE::TESFaction>(fid);
-            if (faction && faction->GetCrimeGold() > 0) {
-                faction->SetCrimeGold(0);
-                faction->SetCrimeGoldViolent(0);
+        std::lock_guard<std::mutex> lock(ownershipMutex_);
+        for (const auto& lease : playerCrimeLeases_) {
+            auto* actor = RE::TESForm::LookupByID<RE::Actor>(lease.actor);
+            auto* faction = RE::TESForm::LookupByID<RE::TESFaction>(lease.faction);
+            if (actor && faction && actor->GetFactionRank(faction, true) == lease.appliedRank) {
+                actor->AddToFaction(faction, static_cast<std::int8_t>(lease.rank));
             }
         }
+        playerCrimeLeases_.clear();
         playerCrimeFactionsRemoved_ = false;
-        logger::info("Battle: Player crime factions restored + bounty cleared");
     }
 
     std::string BattleManager::CalculateBattleMarkerPosition(float playerX, float playerY,
@@ -1635,7 +1626,7 @@ namespace IntelEngine {
                 actor->SetPosition(RE::NiPoint3{finalX, finalY, spawnRef->GetPositionZ()}, true);
             }
 
-            RegisterActor(actor, factionId, 0);
+            RegisterActor(actor, factionId, 0, true);
             soldiers.push_back(actor);
         }
 
@@ -1798,7 +1789,7 @@ namespace IntelEngine {
             std::lock_guard<std::mutex> lock(mutex_);
             if (activeBattle_) {
                 for (const auto& a : activeBattle_->actors) {
-                    formIds.push_back(a.formId);
+                    if (a.ownedSpawn) formIds.push_back(a.formId);
                 }
             }
         }
@@ -1862,7 +1853,7 @@ namespace IntelEngine {
             std::lock_guard<std::mutex> lock(mutex_);
             if (activeBattle_) {
                 for (const auto& a : activeBattle_->actors) {
-                    formIds.push_back(a.formId);
+                    if (a.ownedSpawn) formIds.push_back(a.formId);
                 }
             }
         }
@@ -1892,7 +1883,7 @@ namespace IntelEngine {
             std::lock_guard<std::mutex> lock(mutex_);
             if (!activeBattle_) return;
             for (const auto& a : activeBattle_->actors) {
-                soldierFormIds.push_back(a.formId);
+                if (a.ownedSpawn) soldierFormIds.push_back(a.formId);
             }
         }
 
@@ -1915,5 +1906,206 @@ namespace IntelEngine {
 
     // ClearBattleBounties and RestoreBounties — REMOVED.
     // Bounty prevention handled at spawn time by removing crime factions from soldiers.
+
+    // IEBT v1 keeps battle truth in the same save as Papyrus properties and actors.
+    // JSON is length/depth/count bounded; FormIDs are remapped before publication.
+    void BattleManager::Save(SKSE::SerializationInterface* serialization) {
+        nlohmann::json root;
+        {
+            std::scoped_lock lock(mutex_, pendingMutex_, cleanupMutex_, ownershipMutex_);
+            root["nextBattleId"] = nextBattleId_;
+            root["nextPendingId"] = nextPendingId_;
+            root["suppressBounty"] = suppressBattleBounty_.load();
+            root["cleanup"] = cleanupFormIds_;
+            root["playerCrimeRemoved"] = playerCrimeFactionsRemoved_;
+            root["expired"] = expiredResults_;
+            root["pending"] = nlohmann::json::array();
+            for (const auto& p : pendingBattles_) {
+                root["pending"].push_back({{"id", p.id}, {"factionA", p.factionA}, {"factionB", p.factionB},
+                    {"locationName", p.locationName}, {"x", p.x}, {"y", p.y}, {"z", p.z},
+                    {"deadline", p.deadline}, {"resultJson", p.resultJson}});
+            }
+            auto leases = [](const auto& list) {
+                auto j = nlohmann::json::array();
+                for (const auto& l : list) j.push_back({{"actor", l.actor}, {"faction", l.faction}, {"rank", l.rank}, {"appliedRank", l.appliedRank}});
+                return j;
+            };
+            root["guardLeases"] = leases(guardFactionLeases_);
+            root["crimeLeases"] = leases(playerCrimeLeases_);
+            if (activeBattle_) {
+                const auto& b = *activeBattle_;
+                auto& j = root["active"];
+                j["id"] = b.id;
+                j["warId"] = b.warId;
+                j["factionA"] = b.factionA;
+                j["factionB"] = b.factionB;
+                j["locationName"] = b.locationName;
+                j["moraleA"] = b.moraleA;
+                j["moraleB"] = b.moraleB;
+                j["currentWave"] = b.currentWave;
+                j["waveStartAliveA"] = b.waveStartAliveA;
+                j["waveStartAliveB"] = b.waveStartAliveB;
+                j["firstBloodNarrated"] = b.firstBloodNarrated;
+                j["moraleThresholdsNarrated"] = b.moraleThresholdsNarrated;
+                j["sideAFaction"] = b.sideAFaction;
+                j["playerSide"] = b.playerSide;
+                j["playerParticipated"] = b.playerParticipated;
+                j["playerKillsA"] = b.playerKillsA;
+                j["playerKillsB"] = b.playerKillsB;
+                j["actors"] = nlohmann::json::array();
+                for (const auto& a : b.actors) j["actors"].push_back({{"formId", a.formId}, {"factionId", a.factionId},
+                    {"tier", a.tier}, {"alive", a.alive}, {"ownedSpawn", a.ownedSpawn}});
+            }
+        }
+        const auto payload = root.dump();
+        if (payload.size() > 8 * 1024 * 1024) {
+            logger::error("BattleManager: state exceeds serialization bound");
+            return;
+        }
+        if (!serialization->OpenRecord(kSerializationTag, 1) ||
+            !serialization->WriteRecordData(payload.data(), static_cast<std::uint32_t>(payload.size()))) {
+            logger::error("BattleManager: failed to write IEBT record");
+        }
+    }
+
+    void BattleManager::Load(SKSE::SerializationInterface* serialization, std::uint32_t version, std::uint32_t length) {
+        if (version != 1 || length == 0 || length > 8 * 1024 * 1024) {
+            logger::warn("BattleManager: unsupported or oversized record (version {}, bytes {})", version, length);
+            return;
+        }
+        std::string payload(length, '\0');
+        if (serialization->ReadRecordData(payload.data(), length) != length) return;
+        try {
+            auto root = nlohmann::json::parse(payload, [](int depth, nlohmann::json::parse_event_t, nlohmann::json&) {
+                if (depth > 16) throw std::runtime_error("battle record nesting exceeds bound");
+                return true;
+            });
+            if (!root.is_object()) throw std::runtime_error("battle record is not an object");
+            auto resolve = [&](RE::FormID oldId) {
+                RE::FormID id = 0;
+                if (oldId && serialization->ResolveFormID(oldId, id)) return id;
+                return RE::FormID{0};
+            };
+            auto boundedArray = [](const nlohmann::json& j, size_t limit) {
+                if (!j.is_array() || j.size() > limit) throw std::runtime_error("battle record array exceeds bound");
+            };
+            auto shortString = [](const std::string& value) {
+                if (value.size() > 4096) throw std::runtime_error("battle record string exceeds bound");
+            };
+            std::optional<BattleState> active;
+            if (root.contains("active")) {
+                BattleState b;
+                const auto& j = root.at("active");
+                j.at("id").get_to(b.id);
+                j.at("warId").get_to(b.warId);
+                j.at("factionA").get_to(b.factionA);
+                j.at("factionB").get_to(b.factionB);
+                j.at("locationName").get_to(b.locationName);
+                j.at("moraleA").get_to(b.moraleA);
+                j.at("moraleB").get_to(b.moraleB);
+                j.at("currentWave").get_to(b.currentWave);
+                j.at("waveStartAliveA").get_to(b.waveStartAliveA);
+                j.at("waveStartAliveB").get_to(b.waveStartAliveB);
+                j.at("firstBloodNarrated").get_to(b.firstBloodNarrated);
+                j.at("moraleThresholdsNarrated").get_to(b.moraleThresholdsNarrated);
+                j.at("sideAFaction").get_to(b.sideAFaction);
+                j.at("playerSide").get_to(b.playerSide);
+                j.at("playerParticipated").get_to(b.playerParticipated);
+                j.at("playerKillsA").get_to(b.playerKillsA);
+                j.at("playerKillsB").get_to(b.playerKillsB);
+                shortString(b.factionA); shortString(b.factionB); shortString(b.locationName);
+                shortString(b.playerSide); shortString(b.sideAFaction);
+                if (b.id < 1 || b.id >= INT_MAX - 1 || b.moraleA < 0 || b.moraleA > 100 || b.moraleB < 0 || b.moraleB > 100 ||
+                    b.currentWave < 0 || b.currentWave > 5 || b.moraleThresholdsNarrated.size() > 128) {
+                    throw std::runtime_error("battle state is outside supported bounds");
+                }
+                const auto& actors = j.at("actors");
+                boundedArray(actors, 512);
+                for (const auto& a : actors) {
+                    BattleActor actor;
+                    actor.formId = resolve(a.at("formId").get<RE::FormID>());
+                    a.at("factionId").get_to(actor.factionId);
+                    actor.tier = a.value("tier", 0);
+                    actor.alive = a.value("alive", true);
+                    actor.ownedSpawn = a.value("ownedSpawn", false);
+                    shortString(actor.factionId);
+                    if (actor.tier < 0 || actor.tier > 2) throw std::runtime_error("battle actor tier invalid");
+                    if (actor.formId) b.actors.push_back(std::move(actor));
+                }
+                if (actors.empty() || !b.actors.empty()) active = std::move(b);
+                else logger::warn("BattleManager: all saved actor identities unavailable; not inventing an outcome");
+            }
+            std::vector<PendingBattle> pending;
+            const auto& pendingJson = root.at("pending");
+            boundedArray(pendingJson, 256);
+            for (const auto& j : pendingJson) {
+                PendingBattle p;
+                j.at("id").get_to(p.id); j.at("factionA").get_to(p.factionA); j.at("factionB").get_to(p.factionB);
+                j.at("locationName").get_to(p.locationName);
+                j.at("x").get_to(p.x); j.at("y").get_to(p.y); j.at("z").get_to(p.z);
+                j.at("deadline").get_to(p.deadline); j.at("resultJson").get_to(p.resultJson);
+                shortString(p.factionA); shortString(p.factionB); shortString(p.locationName);
+                if (p.id < 0 || p.id >= INT_MAX - 1 || !std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z) ||
+                    !std::isfinite(p.deadline) || p.resultJson.size() > 1024 * 1024) throw std::runtime_error("invalid pending battle");
+                pending.push_back(std::move(p));
+            }
+            std::vector<RE::FormID> cleanup;
+            boundedArray(root.at("cleanup"), 1024);
+            for (const auto& j : root.at("cleanup")) {
+                if (auto id = resolve(j.get<RE::FormID>())) cleanup.push_back(id);
+            }
+            auto readLeases = [&](const nlohmann::json& array) {
+                boundedArray(array, 2048);
+                std::vector<FactionLease> leases;
+                for (const auto& j : array) {
+                    FactionLease lease;
+                    lease.actor = resolve(j.at("actor").get<RE::FormID>());
+                    lease.faction = resolve(j.at("faction").get<RE::FormID>());
+                    lease.rank = j.at("rank").get<int>();
+                    lease.appliedRank = j.at("appliedRank").get<int>();
+                    if (lease.rank < -1 || lease.rank > 127 || lease.appliedRank < -1 || lease.appliedRank > 127) throw std::runtime_error("invalid faction lease");
+                    if (lease.actor && lease.faction) leases.push_back(lease);
+                }
+                return leases;
+            };
+            auto guards = readLeases(root.at("guardLeases"));
+            auto crimes = readLeases(root.at("crimeLeases"));
+            boundedArray(root.at("expired"), 256);
+            auto expired = root.at("expired").get<std::vector<std::string>>();
+            for (const auto& text : expired) if (text.size() > 1024 * 1024) throw std::runtime_error("expired battle result too large");
+            int nextBattle = root.at("nextBattleId").get<int>();
+            int nextPending = root.at("nextPendingId").get<int>();
+            if (nextBattle < 1 || nextBattle >= INT_MAX || nextPending < 1 || nextPending >= INT_MAX) throw std::runtime_error("invalid battle sequence");
+            if (active) nextBattle = std::max(nextBattle, active->id + 1);
+            for (const auto& p : pending) nextPending = std::max(nextPending, p.id + 1);
+            const bool crimeRemoved = root.value("playerCrimeRemoved", false);
+            const bool suppress = root.value("suppressBounty", false);
+            // Publish only after complete parse/validation. Failed records change nothing.
+            std::scoped_lock lock(mutex_, pendingMutex_, cleanupMutex_, ownershipMutex_);
+            activeBattle_ = std::move(active);
+            pendingBattles_ = std::move(pending);
+            cleanupFormIds_ = std::move(cleanup);
+            guardFactionLeases_ = std::move(guards);
+            playerCrimeLeases_ = std::move(crimes);
+            expiredResults_ = std::move(expired);
+            playerCrimeFactionsRemoved_ = crimeRemoved;
+            suppressBattleBounty_ = suppress && activeBattle_.has_value();
+            nextBattleId_ = nextBattle;
+            nextPendingId_ = nextPending;
+            logger::info("BattleManager: restored active={}, pending={}, cleanup={}", activeBattle_.has_value(), pendingBattles_.size(), cleanupFormIds_.size());
+        } catch (const std::exception& e) {
+            logger::error("BattleManager: rejected IEBT record: {}", e.what());
+        }
+    }
+
+    void BattleManager::Revert() {
+        // Called while switching saves: forgetting prior session state must not
+        // restore its actor mutations into whichever save is about to load.
+        std::scoped_lock lock(mutex_, pendingMutex_, cleanupMutex_, ownershipMutex_);
+        activeBattle_.reset(); pendingBattles_.clear(); cleanupFormIds_.clear();
+        guardFactionLeases_.clear(); playerCrimeLeases_.clear(); modifiedGuardFormIds_.clear();
+        expiredResults_.clear(); playerCrimeFactionsRemoved_ = false;
+        suppressBattleBounty_ = false; nextBattleId_ = 1; nextPendingId_ = 1;
+    }
 
 }  // namespace IntelEngine

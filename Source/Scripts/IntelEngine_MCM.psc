@@ -181,17 +181,11 @@ String Function GetCustomControl(Int optionId)
 EndFunction
 
 Int Function GetVersion()
-    Return 4
+    Return 5
 EndFunction
 
 Event OnConfigInit()
-    Debug.Trace("IntelEngine MCM: OnConfigInit fired")
-    ModName = "IntelEngine"
-    Pages = new String[4]
-    Pages[0] = "Active Tasks"
-    Pages[1] = "Scheduled Tasks"
-    Pages[2] = "Settings"
-    Pages[3] = "Hold Restrictions"
+    EnsurePages()
 EndEvent
 
 Event OnVersionUpdate(Int newVersion)
@@ -204,44 +198,21 @@ Event OnConfigOpen()
 EndEvent
 
 Function EnsurePages()
-    If Pages.Length != 4
-        Pages = new String[4]
-        Pages[0] = "Active Tasks"
-        Pages[1] = "Scheduled Tasks"
-        Pages[2] = "Settings"
-        Pages[3] = "Hold Restrictions"
-        Debug.Trace("IntelEngine MCM: Pages rebuilt to 4")
-    EndIf
+    ModName = "Companion Stories"
+    Pages = new String[1]
+    Pages[0] = "Companion Stories"
 EndFunction
 
 Event OnPageReset(String page)
-    Debug.Trace("IntelEngine MCM: OnPageReset page='" + page + "' Pages.Length=" + Pages.Length)
     SetCursorFillMode(TOP_TO_BOTTOM)
-
-    ; Clear schedule cancel OIDs when NOT on the scheduled page.
-    ; SkyUI reuses OID numbers across pages, so stale cancel OIDs
-    ; stored in StorageUtil can collide with toggles on other pages
-    ; (e.g. OID_TypeMessage on Settings == cancel OID from Scheduled).
-    If page != "Scheduled Tasks" && page != "Scheduled Meetings"
-        Form mcmForm = Self as Form
-        Int ci = 0
-        While ci < 10
-            StorageUtil.UnsetIntValue(mcmForm, "MCM_CancelOID_" + ci)
-            ci += 1
-        EndWhile
-    EndIf
-
-    If page == "" || page == "Active Tasks"
-        ShowStatusPage()
-    ElseIf page == "Scheduled Tasks" || page == "Scheduled Meetings"
-        ShowScheduledPage()
-    ElseIf page == "Settings"
-        ShowSettingsPage()
-    ElseIf page == "Hold Restrictions"
-        ShowHoldRestrictionsPage()
-    EndIf
+    SetCursorPosition(0)
+    AddHeaderOption("Companion Stories")
+    AddTextOption("Personal goals", "Discuss with your companions", OPTION_FLAG_DISABLED)
+    AddTextOption("Progress", "Requires actual game events", OPTION_FLAG_DISABLED)
+    AddTextOption("Follower and travel actions", "Handled by existing mods", OPTION_FLAG_DISABLED)
+    AddTextOption("Legacy world automation", "Retired", OPTION_FLAG_DISABLED)
+    AddTextOption("Based on Galanx's IntelEngine", "Apache License 2.0", OPTION_FLAG_DISABLED)
 EndEvent
-
 ; =============================================================================
 ; STATUS PAGE
 ; =============================================================================
@@ -1398,4 +1369,5 @@ Function ClearSlotWithConfirm(Int slot)
         ForcePageReset()
     EndIf
 EndFunction
+
 

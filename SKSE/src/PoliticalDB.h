@@ -3,7 +3,8 @@
 /**
  * PoliticalDB - IntelEngine-owned SQLite Database
  *
- * Manages IntelEngine.db with all faction politics tables.
+ * An in-memory SQLite working set, persisted only in the current SKSE co-save.
+ * Legacy IntelEngine.db files are read-only migration inputs, never runtime owners.
  * Completely independent from SkyrimNet's database.
  *
  * Tables:
@@ -83,24 +84,33 @@ namespace IntelEngine {
             return &instance;
         }
 
-        /** Open/create database at the given path and ensure all tables exist. */
-        bool Initialize(const std::string& dbPath);
+        static constexpr uint32_t SNAPSHOT_RECORD = 'IEPD';
+        static constexpr uint32_t SNAPSHOT_VERSION = 1;
+
+        /** Open an in-memory working set. With no co-save snapshot, optionally import
+         *  an existing legacy database read-only and trim only the imported working
+         *  copy to the loaded save's time. Empty path means a new game. */
+        bool Initialize(const std::string& legacyPath, float currentGameTime = 0.0f);
+
+        void Save(SKSE::SerializationInterface* intfc);
+        void Load(SKSE::SerializationInterface* intfc, uint32_t version, uint32_t length);
+        /** Close the working set and discard previous-save/opaque snapshot state. */
+        void Revert();
+        bool HasSnapshot() const;
 
         /** Close the database connection. */
         void Shutdown();
 
         /** Check if the database is open and ready. */
-        bool IsReady() const { return db_ != nullptr; }
+        bool IsReady() const;
 
-        /** Delete all rows from political tables where game_time > currentGameTime.
-         *  Used on save load to remove future events from save-scumming.
-         *  Returns total rows deleted across all tables. */
+        /** Legacy-import projection only; never changes an external database and
+         *  never trims an authoritative co-save snapshot. */
         int CleanupFutureEvents(float currentGameTime);
 
-        /** Recalculate player standings from history events.
-         *  Resets all standings to 0 and replays player_standing_history chronologically.
-         *  Called after CleanupFutureEvents to handle save-scumming correctly. */
-        void RecalculatePlayerStandings();
+        /** Legacy migration: replay standing history without erasing title/legacy
+         *  fields. Seed old scalar standings only before the timeline projection. */
+        void RecalculatePlayerStandings(bool seedLegacyHistory = false);
 
         // =================================================================
         // Faction Relations
@@ -210,6 +220,10 @@ namespace IntelEngine {
 
         sqlite3* db_ = nullptr;
         mutable std::mutex mutex_;
+        bool snapshotSeen_ = false;
+        bool snapshotRestored_ = false;
+        uint32_t opaqueVersion_ = 0;
+        std::vector<unsigned char> opaqueSnapshot_;
     };
 
 }  // namespace IntelEngine

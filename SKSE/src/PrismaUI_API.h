@@ -5,6 +5,7 @@
 #pragma once
 
 #include <functional>
+#include <REX/W32/KERNEL32.h>
 #include <queue>
 #include <stdint.h>
 
@@ -55,12 +56,12 @@ namespace PRISMA_UI_API
 
     [[nodiscard]] inline void* RequestPluginAPI(const InterfaceVersion a_interfaceVersion = InterfaceVersion::V1)
     {
-        auto pluginHandle = GetModuleHandle(L"PrismaUI.dll");
+        auto pluginHandle = REX::W32::GetModuleHandleW(L"PrismaUI.dll");
         if (!pluginHandle) {
             return nullptr;
         }
 
-        _RequestPluginAPI requestAPIFunction = (_RequestPluginAPI)GetProcAddress(pluginHandle, "RequestPluginAPI");
+        _RequestPluginAPI requestAPIFunction = (_RequestPluginAPI)REX::W32::GetProcAddress(pluginHandle, "RequestPluginAPI");
         if (requestAPIFunction) {
             return requestAPIFunction(a_interfaceVersion);
         }
@@ -68,3 +69,4 @@ namespace PRISMA_UI_API
         return nullptr;
     }
 }
+

@@ -342,16 +342,11 @@ namespace IntelEngine {
         else                    return "late night";
     }
 
-    // Validate a cached Actor* from m_npcIndex is still alive.
-    // Raw pointers in m_npcIndex become dangling when NPCs unload.
-    // Cross-checks against the engine's form table to catch stale pointers.
-    static RE::Actor* ValidateCachedActor(RE::Actor* cached) {
-        if (!cached) return nullptr;
-        auto formId = cached->GetFormID();
-        if (formId == 0) return nullptr;
-        auto* form = RE::TESForm::LookupByID(formId);
-        if (form != cached || form->IsDeleted()) return nullptr;
-        return cached;
+    // Resolve the ID through the current form table before reading an actor.
+    // Never dereference a cached Actor* to discover whether it is dangling.
+    static RE::Actor* ValidateCachedActor(RE::FormID formId) {
+        auto* actor = RE::TESForm::LookupByID<RE::Actor>(formId);
+        return actor && !actor->IsDeleted() ? actor : nullptr;
     }
 
     void NPCIndex::BuildIndex() {
@@ -395,7 +390,9 @@ namespace IntelEngine {
 
         // Shared resolver: upgrades base FormIDs to Actor reference FormIDs for unique NPCs
         auto resolveBaseFormIDs = [this](RE::TESObjectCELL* cell, int& count) {
-            cell->ForEachReference([&](RE::TESObjectREFR& ref) {
+            cell->ForEachReference([&](RE::TESObjectREFR* referencePtr) {
+            if (!referencePtr) return RE::BSContainer::ForEachResult::kContinue;
+            auto& ref = *referencePtr;
                 auto* actor = ref.As<RE::Actor>();
                 if (!actor || actor->IsDeleted()) return RE::BSContainer::ForEachResult::kContinue;
 
@@ -469,8 +466,8 @@ namespace IntelEngine {
 
         std::string lowerName = StringUtils::ToLowerStd(name);
 
-        // Update with actual Actor reference
-        m_npcIndex[lowerName] = actor;
+        // Cache identity only; resolve the current actor before use.
+        m_npcIndex[lowerName] = actor->GetFormID();
 
         // Update FormID to Actor reference ID (base form ID won't cast to Actor in Papyrus)
         m_npcFormIds[lowerName] = actor->GetFormID();
@@ -1655,18 +1652,55 @@ namespace IntelEngine {
         return "a long time ago";
     }
 
+    void NPCIndex::PublishCandidatePool(bool social, CandidatePool pool) {
+        std::unique_lock lock(m_mutex);
+        (social ? m_npcCandidatePool : m_dmCandidatePool) = std::move(pool);
+    }
+
+    void NPCIndex::ClearCandidatePools() {
+        std::unique_lock lock(m_mutex);
+        m_npcCandidatePool.clear();
+        m_dmCandidatePool.clear();
+    }
+
+    void NPCIndex::ResetSessionState() {
+        std::unique_lock lock(m_mutex);
+        m_npcIndex.clear();
+        m_npcCurrentLocations.clear();
+        std::erase_if(m_npcFormIds, [](const auto& entry) { return (entry.second & 0xFF000000u) == 0xFF000000u; });
+        m_dmCandidatePool.clear();
+        m_npcCandidatePool.clear();
+        m_storyCooldowns.clear();
+        m_socialCooldowns.clear();
+        m_storyTypeCounts.clear();
+        m_lastStoryDispatchGameTime = 0.f;
+        m_lastStoryDispatchType.clear();
+        m_lastNPCDispatchGameTime = 0.f;
+        m_recentGossipContext.clear();
+        m_recentDispatches.clear();
+        m_recentQuestItems.clear();
+        m_recentRescueVictims.clear();
+        m_recentQuestLocations.clear();
+    }
+
     std::string NPCIndex::BuildDungeonMasterContext(int maxCandidates, float absenceDays) {
         // Sync wrapper: runs Phase 0 (SQL prefetch), Phase A (snapshot), and Phase B
         // (build) inline on the calling thread. Preserves stale-bytecode behavior;
         // single source of truth shared with the async path.
         auto prefetch = FetchStoryDMPhaseAPrefetch(maxCandidates, absenceDays);
-        return BuildDungeonMasterContextFromSnapshot(
-            BuildStoryDMTickSnapshot(maxCandidates, absenceDays, prefetch));
+        CandidatePool pool;
+        auto result = BuildDungeonMasterContextFromSnapshot(
+            BuildStoryDMTickSnapshot(maxCandidates, absenceDays, prefetch), pool);
+        PublishCandidatePool(false, std::move(pool));
+        return result;
     }
 
     std::string NPCIndex::BuildNPCInteractionContext(int maxPairs) {
         // Sync wrapper — delegates to async-path snapshot+phase-B for single source of truth.
-        return BuildNPCInteractionContextFromSnapshot(BuildNPCTickSnapshot(maxPairs));
+        CandidatePool pool;
+        auto result = BuildNPCInteractionContextFromSnapshot(BuildNPCTickSnapshot(maxPairs), pool);
+        PublishCandidatePool(true, std::move(pool));
+        return result;
     }
 
     // =========================================================================
@@ -1674,6 +1708,7 @@ namespace IntelEngine {
     // =========================================================================
 
     NPCIndex::NPCTickSnapshot NPCIndex::BuildNPCTickSnapshot(int maxPairs) {
+        MemoryDB::GetSingleton()->RefreshEngineSnapshot();
         NPCTickSnapshot snap;
         snap.maxPairs = maxPairs;
 
@@ -1756,7 +1791,7 @@ namespace IntelEngine {
     // Async NPC interaction tick — Phase B (markdown, worker thread)
     // =========================================================================
 
-    std::string NPCIndex::BuildNPCInteractionContextFromSnapshot(const NPCTickSnapshot& snap) {
+    std::string NPCIndex::BuildNPCInteractionContextFromSnapshot(const NPCTickSnapshot& snap, CandidatePool& pool) {
         if (snap.candidates.empty()) return "";
 
         auto* memDB = MemoryDB::GetSingleton();
@@ -1826,11 +1861,10 @@ namespace IntelEngine {
 
         // Update NPC candidate pool for name->FormID resolution from response.
         {
-            std::unique_lock poolLock(m_mutex);
-            m_npcCandidatePool.clear();
+            pool.clear();
             for (const auto& group : groups) {
                 for (const auto& n : group.npcs) {
-                    m_npcCandidatePool[n.actor->nameLower] = n.actor->formId;
+                    pool[n.actor->nameLower] = n.actor->formId;
                 }
             }
         }
@@ -1874,7 +1908,7 @@ namespace IntelEngine {
                     md += " {";  md += bioForMd;  md += "}";
                 }
 
-                auto memories = memDB->GetFormattedMemories(a->formId, 2);
+                auto memories = memDB->GetFormattedMemories(a->formId, 2, snap.currentGameTime * 86400.0f);
                 if (!memories.empty()) {
                     md += ": ";  md += memories;
                 }
@@ -2000,7 +2034,7 @@ namespace IntelEngine {
 
         auto* calendar = RE::Calendar::GetSingleton();
         snap.currentGameTime = calendar ? calendar->GetCurrentGameTime() : 0.f;
-        snap.currentDBHours  = memDB->GetCurrentDBHours();
+        snap.currentDBHours  = snap.currentGameTime * 86400.0f;
 
         // Take shared_lock for the std::string copy — writers (NotifyStoryTypePicked)
         // hold unique_lock on m_mutex when mutating these fields.
@@ -2139,7 +2173,7 @@ namespace IntelEngine {
     // Async Story DM tick — Phase B (scoring + markdown, worker thread)
     // =========================================================================
 
-    std::string NPCIndex::BuildDungeonMasterContextFromSnapshot(const StoryDMTickSnapshot& snap) {
+    std::string NPCIndex::BuildDungeonMasterContextFromSnapshot(const StoryDMTickSnapshot& snap, CandidatePool& pool) {
         if (snap.candidates.empty()) return "";
 
         auto* memDB = MemoryDB::GetSingleton();
@@ -2247,10 +2281,9 @@ namespace IntelEngine {
 
         // Update DM candidate pool for response resolution
         {
-            std::unique_lock poolLock(m_mutex);
-            m_dmCandidatePool.clear();
+            pool.clear();
             for (const auto& s : finalPool) {
-                m_dmCandidatePool[s.a->nameLower] = s.a->formId;
+                pool[s.a->nameLower] = s.a->formId;
             }
         }
 
@@ -2429,11 +2462,11 @@ namespace IntelEngine {
             // Familiarity tier
             std::string familiarityStr = "stranger (never interacted)";
             {
-                auto dialogue = memDB->GetRecentDialogueForActor(a->dbFormId, 1);
+                auto dialogue = memDB->GetRecentDialogueForActor(a->dbFormId, 1, snap.playerName);
                 if (!dialogue.empty()) {
                     familiarityStr = "acquainted (has spoken directly)";
                 } else {
-                    auto memories = memDB->GetFormattedMemories(a->dbFormId, 1);
+                    auto memories = memDB->GetFormattedMemories(a->dbFormId, 1, snap.currentDBHours);
                     if (!memories.empty()) {
                         familiarityStr = "acquainted (shared history)";
                     } else {
@@ -2471,17 +2504,17 @@ namespace IntelEngine {
                 md += "Relationships:\n";  md += bioRels;  md += "\n";
             }
 
-            auto memories = memDB->GetFormattedMemories(a->dbFormId, memPerCandidate);
+            auto memories = memDB->GetFormattedMemories(a->dbFormId, memPerCandidate, snap.currentDBHours);
             if (!memories.empty()) {
                 md += "Memories:\n";  md += memories;  md += "\n";
             }
 
-            auto dialogue = memDB->GetRecentDialogueForActor(a->dbFormId, 3);
+            auto dialogue = memDB->GetRecentDialogueForActor(a->dbFormId, 3, snap.playerName);
             if (!dialogue.empty()) {
                 md += "Last conversation:\n";  md += dialogue;  md += "\n";
             }
 
-            auto recentEvents = memDB->GetRecentEventsForActor(a->dbFormId, 3);
+            auto recentEvents = memDB->GetRecentEventsForActor(a->dbFormId, 3, snap.currentDBHours);
             if (!recentEvents.empty()) {
                 md += "Recent:\n";  md += recentEvents;  md += "\n";
             }

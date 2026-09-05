@@ -30,6 +30,8 @@
 #include <shared_mutex>
 #include <string>
 #include <thread>
+#include <chrono>
+#include <functional>
 
 namespace IntelEngine {
 
@@ -88,6 +90,9 @@ namespace IntelEngine {
 
         /** Disarm all slots. Called on game load / revert. */
         void DisarmAll();
+        // Consume once at Papyrus execution time, not merely at VM queue time.
+        int ConsumeReceipt(const std::string& receipt);
+        void DeferMaintenance(std::function<void()> callback);
 
         /** Start the background worker thread. Idempotent. */
         void Start();
@@ -106,6 +111,8 @@ namespace IntelEngine {
 
         struct Watch {
             bool armed = false;
+            std::uint64_t epoch = 0;
+            std::uint64_t generation = 0;
             RE::FormID agentFormID = 0;
             RE::FormID targetFormID = 0;
             float threshold = DEFAULT_ACTOR_THRESHOLD;
@@ -118,8 +125,13 @@ namespace IntelEngine {
         void WorkerLoop();
 
         std::array<Watch, MAX_SLOTS> m_slots{};
+        std::array<std::uint64_t, MAX_SLOTS> m_generations{};
+        std::array<std::uint64_t, MAX_SLOTS> m_receiptEpochs{};
         mutable std::shared_mutex m_mutex;
         std::atomic<bool> m_running{false};
+        std::atomic<bool> m_tickPending{false};
+        std::function<void()> m_maintenance;
+        std::chrono::steady_clock::time_point m_maintenanceAt;
         std::thread m_thread;
     };
 

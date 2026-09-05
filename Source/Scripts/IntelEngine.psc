@@ -1102,3 +1102,17 @@ Int Function GetJsonArrayLength(String json, String key) Global Native
 
 ; Get item at index from a JSON array. If key is empty, treats json as the array.
 String Function GetJsonArrayItem(String json, String key, Int index) Global Native
+
+; Session-scoped async bridge; callbacks retain the released response ABI.
+Int Function SendSessionPrompt(String promptName, String variant, String contextJson, Quest callbackQuest, String callbackScript, String callbackFn) Global Native
+
+Bool Function IsCurrentSessionResponse(String envelope) Global Native
+String Function UnwrapSessionResponse(String envelope) Global Native
+
+Bool Function GetActorEssentialFlag(Actor npc) Global Native
+Function SetActorEssentialFlag(Actor npc, Bool value) Global Native
+Bool Function GetActorNoBleedoutRecovery(Actor npc) Global Native
+Bool Function GetActorDontMove(Actor npc) Global Native
+Bool Function GetActorRestrained(Actor npc) Global Native
+
+Int Function ConsumeProximityReceipt(String receipt) Global Native

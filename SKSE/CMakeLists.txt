@@ -5,9 +5,9 @@ cmake_minimum_required(VERSION 3.21)
 # =============================================================================
 
 project(
-    IntelEngine
-    VERSION 3.5.0
-    DESCRIPTION "Intelligent NPC Task Execution for SkyrimNet"
+    CompanionStories
+    VERSION 0.1.0
+    DESCRIPTION "Evidence-based personal companion stories for SkyrimNet"
     LANGUAGES CXX
 )
 
@@ -18,7 +18,13 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Dependencies (via vcpkg)
 # =============================================================================
 
-find_package(CommonLibSSE CONFIG REQUIRED)
+if(COMMONLIBSSE_NG_ROOT)
+    set(BUILD_TESTS OFF CACHE BOOL "Build CommonLib tests" FORCE)
+    add_subdirectory("${COMMONLIBSSE_NG_ROOT}" "${CMAKE_BINARY_DIR}/commonlib")
+    include("${COMMONLIBSSE_NG_ROOT}/cmake/CommonLibSSE.cmake")
+else()
+    find_package(CommonLibSSE CONFIG REQUIRED)
+endif()
 find_package(fmt CONFIG REQUIRED)
 find_package(rapidfuzz CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
@@ -31,6 +37,7 @@ find_package(unofficial-sqlite3 CONFIG REQUIRED)
 
 set(SOURCES
     src/Plugin.cpp
+    src/PersonalStories.cpp
     src/Papyrus.cpp
     src/NPCIndex.cpp
     src/ItemIndex.cpp
@@ -43,7 +50,6 @@ set(SOURCES
     src/OffScreenTracker.cpp
     src/ProximityMonitor.cpp
     src/SlotTracker.cpp
-    src/ProximityMonitor.cpp
     src/MemoryDB.cpp
     src/DashboardConfig.cpp
     src/DashboardUIManager.cpp
@@ -63,6 +69,8 @@ add_commonlibsse_plugin(
     ${PROJECT_NAME}
     SOURCES ${SOURCES}
 )
+
+set_target_properties(${PROJECT_NAME} PROPERTIES OUTPUT_NAME IntelEngine)
 
 target_include_directories(
     ${PROJECT_NAME}
@@ -96,9 +104,10 @@ endif()
 # =============================================================================
 
 # Copy to Skyrim Data folder if environment variable is set
-if(DEFINED ENV{SKYRIM_FOLDER})
+option(INTELENGINE_DEPLOY_AFTER_BUILD "Copy build output into a game installation" OFF)
+if(INTELENGINE_DEPLOY_AFTER_BUILD AND DEFINED ENV{SKYRIM_FOLDER})
     set(OUTPUT_FOLDER "$ENV{SKYRIM_FOLDER}/Data/SKSE/Plugins")
-elseif(DEFINED ENV{SKYRIM_MODS_FOLDER})
+elseif(INTELENGINE_DEPLOY_AFTER_BUILD AND DEFINED ENV{SKYRIM_MODS_FOLDER})
     set(OUTPUT_FOLDER "$ENV{SKYRIM_MODS_FOLDER}/IntelEngine/SKSE/Plugins")
 endif()
 
@@ -122,3 +131,5 @@ if(DEFINED OUTPUT_FOLDER)
         )
     endif()
 endif()
+
+

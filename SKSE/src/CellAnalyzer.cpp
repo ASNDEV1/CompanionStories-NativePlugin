@@ -24,7 +24,9 @@ namespace IntelEngine {
 
         // Iterate through all references in the cell
         // Note: CommonLibSSE-NG ForEachReference takes TESObjectREFR& (reference), not pointer
-        cell->ForEachReference([&doors](RE::TESObjectREFR& ref) {
+        cell->ForEachReference([&doors](RE::TESObjectREFR* reference) {
+            if (!reference) return RE::BSContainer::ForEachResult::kContinue;
+            auto& ref = *reference;
             // Check if it's a door
             auto* baseObj = ref.GetBaseObject();
             if (!baseObj) return RE::BSContainer::ForEachResult::kContinue;
@@ -326,7 +328,9 @@ namespace IntelEngine {
         auto* cell = actor->GetParentCell();
         if (!cell) return results;
 
-        cell->ForEachReference([&results, this](RE::TESObjectREFR& ref) {
+        cell->ForEachReference([&results, this](RE::TESObjectREFR* reference) {
+            if (!reference) return RE::BSContainer::ForEachResult::kContinue;
+            auto& ref = *reference;
             if (ref.IsDisabled()) return RE::BSContainer::ForEachResult::kContinue;
 
             if (IsCookingStation(&ref)) {
@@ -351,7 +355,9 @@ namespace IntelEngine {
         float actorY = actor->GetPositionY();
         float actorZ = actor->GetPositionZ();
 
-        cell->ForEachReference([&results, actorZ, minZDiff](RE::TESObjectREFR& ref) {
+        cell->ForEachReference([&results, actorZ, minZDiff](RE::TESObjectREFR* reference) {
+            if (!reference) return RE::BSContainer::ForEachResult::kContinue;
+            auto& ref = *reference;
             if (ref.IsDisabled()) return RE::BSContainer::ForEachResult::kContinue;
 
             auto* baseObj = ref.GetBaseObject();
@@ -393,7 +399,9 @@ namespace IntelEngine {
         float actorY = actor->GetPositionY();
         float actorZ = actor->GetPositionZ();
 
-        cell->ForEachReference([&results, actorZ, minZDiff](RE::TESObjectREFR& ref) {
+        cell->ForEachReference([&results, actorZ, minZDiff](RE::TESObjectREFR* reference) {
+            if (!reference) return RE::BSContainer::ForEachResult::kContinue;
+            auto& ref = *reference;
             if (ref.IsDisabled()) return RE::BSContainer::ForEachResult::kContinue;
 
             auto* baseObj = ref.GetBaseObject();

@@ -1,4 +1,5 @@
 #include "DialogueTracker.h"
+#include "AsyncDispatch.h"
 #include "SkyrimNetAPI.h"
 #include <nlohmann/json.hpp>
 
@@ -8,7 +9,9 @@ namespace IntelEngine {
     static void SendActorModEvent(RE::FormID formId, const char* eventName, const std::string& strArg) {
         auto* task = SKSE::GetTaskInterface();
         if (!task) return;
-        task->AddTask([formId, eventName = std::string(eventName), strArg]() {
+        const auto epoch = AsyncDispatch::CurrentSessionEpoch();
+        task->AddTask([formId, eventName = std::string(eventName), strArg, epoch]() {
+            if (!AsyncDispatch::IsSessionCurrent(epoch)) return;
             auto* actor = RE::TESForm::LookupByID<RE::Actor>(formId);
             if (!actor) return;
             auto* eventMgr = SKSE::GetModCallbackEventSource();
@@ -46,6 +49,12 @@ namespace IntelEngine {
         }
     }
 
+    void DialogueTracker::Revert() {
+        enabled_.store(false);
+        std::lock_guard lock(mutex_);
+        lineCounts_.clear();
+    }
+
     int DialogueTracker::GetCount(RE::FormID formId) const {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = lineCounts_.find(formId);
@@ -73,6 +82,8 @@ namespace IntelEngine {
 
     void DialogueTracker::OnDialogueEvent(const char* json) {
         if (!enabled_.load() || threshold_.load() <= 0) return;
+        const auto epoch = AsyncDispatch::CurrentSessionEpoch();
+        if (!AsyncDispatch::IsSessionCurrent(epoch)) return;
 
         try {
             auto j = nlohmann::json::parse(json);
@@ -93,6 +104,7 @@ namespace IntelEngine {
 
             {
                 std::lock_guard<std::mutex> lock(mutex_);
+                if (!AsyncDispatch::IsSessionCurrent(epoch)) return;
                 lineCounts_[formId]++;
                 newCount = lineCounts_[formId];
                 if (newCount >= threshold) {

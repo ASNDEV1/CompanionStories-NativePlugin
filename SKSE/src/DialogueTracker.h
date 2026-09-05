@@ -27,6 +27,7 @@ namespace IntelEngine {
 
         /** Unregister the callback (cleanup). */
         void Shutdown();
+        void Revert();
 
         /** Set the line threshold for triggering a bio update. 0 = disabled. */
         void SetThreshold(int lines) { threshold_.store(lines); }
