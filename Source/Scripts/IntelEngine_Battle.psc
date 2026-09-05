@@ -27,6 +27,8 @@ Scriptname IntelEngine_Battle extends Quest
 ; If player has 0 standing with both factions, default assignment is used.
 ; =============================================================================
 
+Bool Property LegacyAutomationRetired = false Auto Hidden
+
 ; === Properties ===
 IntelEngine_Core Property Core Auto
 Faction Property Intel_BattleSideA Auto
@@ -102,6 +104,9 @@ Float Property ManifestCleanupDelay = 90.0 Auto Hidden  ; real seconds before cl
 ; =============================================================================
 
 Function ScheduleBattle(String factionA, String factionB, Int warId, Float gameTime)
+    If LegacyAutomationRetired
+        Return
+    EndIf
     If BattleScheduled || IntelEngine.IsBattleActive()
         Core.DebugMsg("Battle: Cannot schedule — already scheduled or active")
         return
@@ -129,6 +134,9 @@ EndFunction
 ; =============================================================================
 
 Function StartPendingBattlePoll()
+    If LegacyAutomationRetired
+        Return
+    EndIf
     If PendingPollActive
         ; Already polling — new pending battle will be picked up by existing loop
         return
@@ -140,6 +148,9 @@ Function StartPendingBattlePoll()
 EndFunction
 
 Function HandlePendingBattleTriggered(Int pendingId)
+    If LegacyAutomationRetired
+        Return
+    EndIf
     ; Get info THEN remove atomically — prevents TOCTOU re-trigger on next poll cycle.
     ; Remove MUST happen before any early return to avoid infinite re-trigger loop.
     String infoJson = IntelEngine.GetPendingBattleInfo(pendingId)
@@ -200,6 +211,9 @@ EndFunction
 ; =============================================================================
 
 Event OnUpdateGameTime()
+    If LegacyAutomationRetired
+        Return
+    EndIf
     If !BattleScheduled
         return
     EndIf
@@ -215,6 +229,9 @@ Event OnUpdateGameTime()
 EndEvent
 
 Event OnUpdate()
+    If LegacyAutomationRetired
+        Return
+    EndIf
     ; Manifestation cleanup check (micro-encounters from political events)
     If ManifestActive
         Float elapsed = Utility.GetCurrentRealTime() - ManifestStartTime
@@ -416,6 +433,9 @@ EndEvent
 ; Start a battle immediately (no schedule delay). Used by quest-dispatched
 ; faction_battle where the player has already traveled to the location.
 Function StartBattleImmediate(String factionA, String factionB, Int warId)
+    If LegacyAutomationRetired
+        Return
+    EndIf
     If IntelEngine.IsBattleActive()
         Core.DebugMsg("Battle: Cannot start immediate — already active")
         return
@@ -430,6 +450,9 @@ Function StartBattleImmediate(String factionA, String factionB, Int warId)
 EndFunction
 
 Function StartBattleSequence()
+    If LegacyAutomationRetired
+        Return
+    EndIf
     BattleScheduled = false
 
     ; Determine location name from player's current area
@@ -1230,6 +1253,9 @@ EndFunction
 ; =============================================================================
 
 Function ManifestEvent(String manifestJson)
+    If LegacyAutomationRetired
+        Return
+    EndIf
     ; Guard: no active battle or manifestation
     ; Safety: if ManifestActive is stuck for > 2 minutes (stale save state), force-clear it
     If ManifestActive
@@ -1457,6 +1483,9 @@ EndFunction
 ; Called by Travel.OnArrival when an assassination task NPC reaches their target.
 ; The assassin walked there via the task system — now trigger the attack.
 Function HandleAssassinArrival(Actor assassin, String targetName)
+    If LegacyAutomationRetired
+        Return
+    EndIf
     ; Re-entrancy guard — prevents double-fire from Travel.OnArrival + OnUpdate hard timeout
     If ManifestAssassinAttacked
         return
@@ -1605,41 +1634,47 @@ EndFunction
 ; =============================================================================
 
 Function OnGameReload()
-    ; Session rollover: Utility.GetCurrentRealTime() resets each Skyrim launch
-    ; but these properties are saved. A stale saved value (> current real time)
-    ; comes from a prior session and would break timeout/elapsed checks (the
-    ; elapsed diff goes negative, so "stuck" watchdogs never trip). Snap stale
-    ; stamps forward to `now` so the countdown restarts from load.
-    Float now = Utility.GetCurrentRealTime()
-    If BattleStartRealTime > now
-        BattleStartRealTime = now
+    ; Released entry point retained for old saved callers.
+    RetireAutomation()
+EndFunction
+
+Function RetireAutomation()
+    If Core == None
+        Quest ownerQuest = Self as Quest
+        Core = ownerQuest as IntelEngine_Core
     EndIf
-    If DeferredCleanupStart > now
-        DeferredCleanupStart = now
-    EndIf
-    If ManifestStartTime > now
-        ManifestStartTime = now
+    If Core == None
+        Debug.Trace("IntelEngine retirement: Core unavailable; preserving tracked state")
+        Return
     EndIf
 
-    ; Clean up any active manifestation from pre-reload
-    If ManifestActive
-        CleanupManifestation()
+    LegacyAutomationRetired = true
+    UnregisterForUpdate()
+    UnregisterForUpdateGameTime()
+    RemovePlayerFromBattle()
+    CleanupAllActors()
+    Int i = 0
+    If ManifestActors != None
+        While i < ManifestActors.Length
+            Actor spawned = ManifestActors[i]
+            If spawned != None
+                Int slot = Core.FindOwnedAliasForCleanup(spawned)
+                If slot >= 0
+                    Core.ClearSlot(slot)
+                EndIf
+                spawned.DisableNoWait()
+                spawned.Delete()
+                ManifestActors[i] = None
+            EndIf
+            i += 1
+        EndWhile
     EndIf
-
-    ; If a battle was in progress when the game was saved, clean up
-    ; Battle state is not save-persistent in C++ (BattleManager resets on load)
-    ; ActiveBattleId >= 0 catches battles that started but never spawned (player was indoors)
-    If BattleSpawned || BattleScheduled || ActiveBattleId >= 0
-        Core.DebugMsg("Battle: Game reloaded during active battle — cleaning up")
-        ; Clear C++ active battle BEFORE Papyrus ResetState (which sets ActiveBattleId = -1)
-        IntelEngine.EndBattle(ActiveBattleId, "reload", "")
-        RemovePlayerFromBattle()
-        CleanupAllActors()
-        CleanupMarkers()
-        ResetState()
-    EndIf
-
-    ; Clear stale pending battles from C++ singleton (persists across reloads)
+    ManifestActive = false
+    ManifestCount = 0
+    ManifestLeaderTarget = None
+    CleanupMarkers()
+    ResetState()
     IntelEngine.ClearPendingBattles()
+    IntelEngine.RestorePlayerCrimeFactions()
     PendingPollActive = false
 EndFunction

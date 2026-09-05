@@ -104,7 +104,7 @@ namespace IntelEngine {
 
         /** Load slot state from SKSE co-save. Called from Plugin LoadCallback.
          *  Resolves FormIDs for load-order changes, validates actors. */
-        void Load(SKSE::SerializationInterface* a_intfc);
+        void Load(SKSE::SerializationInterface* a_intfc, uint32_t version, uint32_t length);
 
         /** Returns true if slot state was loaded from co-save (skip StorageUtil recovery). */
         bool HasCoSaveData() const { return m_hasCoSaveData.load(std::memory_order_acquire); }

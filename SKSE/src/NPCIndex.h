@@ -457,9 +457,13 @@ namespace IntelEngine {
         /**
          * Phase B — worker thread. Build markdown context from the snapshot.
          * Performs SQL queries (GetSociallyActiveFormIDs, GetFormattedMemories) and
-         * formats the output. Updates m_npcCandidatePool under m_mutex.
+         * formats the output. Returns candidate IDs without publishing mutable state.
          */
-        std::string BuildNPCInteractionContextFromSnapshot(const NPCTickSnapshot& snap);
+        using CandidatePool = std::unordered_map<std::string, RE::FormID>;
+        void PublishCandidatePool(bool social, CandidatePool pool);
+        void ClearCandidatePools();
+        void ResetSessionState();
+        std::string BuildNPCInteractionContextFromSnapshot(const NPCTickSnapshot& snap, CandidatePool& pool);
 
         /** Per-actor data for Story DM tick (richer than NPC tick — has position + dbFormId). */
         struct StoryDMActorSnapshot {
@@ -552,9 +556,9 @@ namespace IntelEngine {
         /**
          * Phase B — worker thread. Score candidates, sort, trim, build markdown.
          * All per-candidate SQL queries run here (memories, dialogue, events, related,
-         * bio relationships). Updates m_dmCandidatePool under m_mutex.
+         * bio relationships). Returns candidate IDs for main-thread publication.
          */
-        std::string BuildDungeonMasterContextFromSnapshot(const StoryDMTickSnapshot& snap);
+        std::string BuildDungeonMasterContextFromSnapshot(const StoryDMTickSnapshot& snap, CandidatePool& pool);
 
         /**
          * Get FormIDs of all NPCs in the last DM candidate pool.
@@ -602,8 +606,8 @@ namespace IntelEngine {
         // Thread-safe access
         mutable std::shared_mutex m_mutex;
 
-        // Main index: lowercase name -> Actor* (only loaded NPCs)
-        std::unordered_map<std::string, RE::Actor*> m_npcIndex;
+        // Main index: lowercase name -> Actor FormID, re-resolved before engine use.
+        std::unordered_map<std::string, RE::FormID> m_npcIndex;
 
         // FormID index: lowercase name -> FormID (ALL NPCs including unloaded)
         std::unordered_map<std::string, RE::FormID> m_npcFormIds;

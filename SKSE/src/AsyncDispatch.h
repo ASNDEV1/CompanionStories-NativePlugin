@@ -17,6 +17,7 @@
  */
 
 #include <atomic>
+#include <cstdint>
 #include <condition_variable>
 #include <functional>
 #include <mutex>
@@ -26,6 +27,23 @@
 
 namespace IntelEngine::AsyncDispatch {
 
+    enum class Lane : std::uint8_t { NPC, Story, Politics };
+    struct RequestToken {
+        std::uint64_t epoch = 0;
+        std::uint64_t sequence = 0;
+        Lane lane = Lane::NPC;
+    };
+
+    // Called before loading/reverting. Cancels queued work and makes all running
+    // work and posted main-thread callbacks stale without blocking the game.
+    void InvalidateSession();
+    // Called only after a successful load or new-game initialization.
+    void ResumeSession();
+    RequestToken BeginRequest(Lane lane);
+    bool IsCurrent(RequestToken token);
+    std::uint64_t CurrentSessionEpoch();
+    bool IsSessionCurrent(std::uint64_t epoch);
+
     /** Start the worker thread. Idempotent. */
     void Initialize();
 
@@ -34,6 +52,7 @@ namespace IntelEngine::AsyncDispatch {
 
     /** Submit work to run on the worker thread. */
     void Submit(std::function<void()> work);
+    void Submit(RequestToken token, std::function<void()> work);
 
     /**
      * Dispatch a Papyrus quest function from C++ via DispatchMethodCall1.
@@ -54,5 +73,9 @@ namespace IntelEngine::AsyncDispatch {
                                     const std::string& scriptName,
                                     const std::string& functionName,
                                     const std::string& stringArg);
+    bool ExecuteQuestFunctionResponse(const std::string& questEditorId,
+                                      const std::string& scriptName,
+                                      const std::string& functionName,
+                                      const std::string& response, int success);
 
 }  // namespace IntelEngine::AsyncDispatch

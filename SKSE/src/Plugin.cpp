@@ -24,6 +24,7 @@
 #include "StringUtils.h"
 #include "AsyncDispatch.h"
 #include "ProximityMonitor.h"
+#include "PersonalStories.h"
 
 #include <fstream>
 #include <chrono>
@@ -56,7 +57,7 @@ namespace IntelEngine {
     constexpr uint32_t SAVE_ID_VERSION = 1;
 
     static std::string g_currentSaveID;
-    static bool g_hasReverted = false;
+
 
     /** Generate a unique per-save ID (timestamp + random suffix) for DB path isolation. */
     static std::string GenerateUniqueID() {
@@ -94,6 +95,9 @@ namespace IntelEngine {
 
         // Persist slot tracker state (task recovery without StorageUtil on load)
         SlotTracker::GetSingleton()->Save(a_intfc);
+        PoliticalDB::GetSingleton()->Save(a_intfc);
+        BattleManager::GetSingleton()->Save(a_intfc);
+        PersonalStories::Save(a_intfc);
     }
 
     void LoadCallback(SKSE::SerializationInterface* a_intfc) {
@@ -105,22 +109,37 @@ namespace IntelEngine {
                     continue;
                 }
                 uint32_t strLen = 0;
-                a_intfc->ReadRecordData(&strLen, sizeof(strLen));
-                if (strLen > 0 && strLen < 256) {
+                if (length < sizeof(strLen) || a_intfc->ReadRecordData(&strLen, sizeof(strLen)) != sizeof(strLen)) continue;
+                if (strLen > 0 && strLen < 256 && length == sizeof(strLen) + strLen) {
                     std::string id(strLen, '\0');
-                    a_intfc->ReadRecordData(id.data(), strLen);
+                    if (a_intfc->ReadRecordData(id.data(), strLen) != strLen) continue;
+                    if (id.find_first_not_of("0123456789-") != std::string::npos) continue;
                     g_currentSaveID = id;
                     logger::info("LoadCallback: Loaded save ID '{}'", g_currentSaveID);
                 }
             } else if (type == 'IETK') {
-                SlotTracker::GetSingleton()->Load(a_intfc);
+                SlotTracker::GetSingleton()->Load(a_intfc, version, length);
+            } else if (type == 'IEPD') {
+                PoliticalDB::GetSingleton()->Load(a_intfc, version, length);
+            } else if (type == PersonalStories::kRecordType) {
+                PersonalStories::Load(a_intfc, version, length);
+            } else if (type == 'IEBT') {
+                BattleManager::GetSingleton()->Load(a_intfc, version, length);
             }
         }
     }
 
     void RevertCallback(SKSE::SerializationInterface*) {
+        AsyncDispatch::InvalidateSession();
+        PersonalStories::Revert();
+        MemoryDB::GetSingleton()->ClearCaches();
+        NPCIndex::GetSingleton()->ResetSessionState();
+        QuestStateTracker::GetSingleton()->Clear();
+        DialogueTracker::GetSingleton()->Revert();
+        PoliticalDB::GetSingleton()->Revert();
+        BattleManager::GetSingleton()->Revert();
         g_currentSaveID.clear();
-        g_hasReverted = true;
+
         // Increment load generation to cancel any pending deferred Maintenance dispatch
         // from a previous load (prevents double-dispatch on rapid save reload).
         auto* tracker = SlotTracker::GetSingleton();
@@ -134,41 +153,22 @@ namespace IntelEngine {
             tracker->loadGeneration.load(std::memory_order_relaxed));
     }
 
-    /** Initialize PoliticalDB with per-save database path + timeline cleanup. */
-    static void InitializePoliticalDB() {
+    /** External files are read-only legacy inputs. Current truth lives in the co-save. */
+    static void InitializePoliticalDB(bool newGame = false) {
         std::string saveID = GetSaveUniqueID();
 
         // Build path: Data/SKSE/Plugins/IntelEngine/data/IntelEngine-{saveID}.db
         std::filesystem::path dbDir = std::filesystem::current_path() / "Data" / "SKSE" / "Plugins" / "IntelEngine" / "data";
-        if (!std::filesystem::exists(dbDir)) {
-            std::filesystem::create_directories(dbDir);
-        }
         std::filesystem::path dbPath = dbDir / ("IntelEngine-" + saveID + ".db");
 
         auto* db = PoliticalDB::GetSingleton();
 
-        // Close existing connection if switching saves
-        if (db->IsReady()) {
-            db->Shutdown();
-        }
-
-        if (!db->Initialize(PathToUtf8(dbPath))) {
+        auto* calendar = RE::Calendar::GetSingleton();
+        const float currentGameTime = calendar ? calendar->GetCurrentGameTime() : 0.0f;
+        if (!db->Initialize(newGame ? std::string{} : PathToUtf8(dbPath), currentGameTime)) {
             logger::error("Failed to initialize PoliticalDB");
             return;
         }
-
-        // Timeline cleanup: delete events from the future (save-scumming)
-        auto* calendar = RE::Calendar::GetSingleton();
-        if (calendar) {
-            float currentGameTime = calendar->GetCurrentGameTime();
-            int cleaned = db->CleanupFutureEvents(currentGameTime);
-            if (cleaned > 0) {
-                logger::info("PoliticalDB: Cleaned {} future events (game time: {:.2f})", cleaned, currentGameTime);
-            }
-        }
-
-        // Recalculate player standings from history (handles save-scumming correctly)
-        db->RecalculatePlayerStandings();
 
         // Clear FactionPolitics in-memory caches
         FactionPolitics::GetSingleton()->ClearCaches();
@@ -335,13 +335,18 @@ namespace IntelEngine {
 
     void MessageHandler(SKSE::MessagingInterface::Message* a_msg) {
         switch (a_msg->type) {
+            case SKSE::MessagingInterface::kPreLoadGame:
+                AsyncDispatch::InvalidateSession();
+                ProximityMonitor::GetSingleton()->DisarmAll();
+                break;
             case SKSE::MessagingInterface::kDataLoaded:
                 // Game data is loaded - initialize SkyrimNet API and build NPC index
                 // Note: PoliticalDB + FactionPolitics init deferred to kNewGame/kPostLoadGame
                 // (requires save ID for per-save database path)
                 logger::info("Data loaded - initializing SkyrimNet API and NPC index");
                 MemoryDB::GetSingleton()->InitializeAPI();
-                DialogueTracker::GetSingleton()->Initialize();
+                PersonalStories::Initialize();
+                // Legacy automatic biography rewriting is retired.
 
                 // Register quest decorator with SkyrimNet (soft dependency — skipped if API unavailable)
                 if (SkyrimNetAPI::RegisterDecorator) {
@@ -359,15 +364,16 @@ namespace IntelEngine {
                     }
                 }
 
-                DashboardConfig::GetSingleton()->Load();
-                DashboardUIManager::GetSingleton()->Initialize();
+                // Legacy political dashboard is no longer an active component.
+
                 NPCIndex::GetSingleton()->BuildIndex();
                 LocationResolver::GetSingleton()->BuildLocationIndex();
                 ItemIndex::GetSingleton()->BuildIndex();
-                FactionPolitics::GetSingleton()->LoadSettings();
+
                 break;
 
             case SKSE::MessagingInterface::kNewGame:
+                RevertCallback(nullptr);
                 // New game — clear SlotTracker state, force DB re-discovery
                 logger::info("New game - clearing SlotTracker, clearing MemoryDB caches");
                 SlotTracker::GetSingleton()->ClearAll();
@@ -375,49 +381,46 @@ namespace IntelEngine {
                 NPCIndex::GetSingleton()->RefreshIndex();
                 MemoryDB::GetSingleton()->ClearCaches();
                 // Initialize per-save political DB (new save ID generated)
-                InitializePoliticalDB();
-                FactionPolitics::GetSingleton()->Initialize();
+                InitializePoliticalDB(true);
+                // Political state remains readable; retired simulation is not initialized.
+                MemoryDB::GetSingleton()->RefreshEngineSnapshot();
+                AsyncDispatch::ResumeSession();
+                PersonalStories::ResumeSession();
                 // Bootstrap: start quest and call Maintenance for first install
                 {
                     auto* task = SKSE::GetTaskInterface();
                     if (task) {
-                        task->AddTask([]() { DispatchMaintenanceCall(true); });
+                        const auto epoch = AsyncDispatch::CurrentSessionEpoch();
+                        task->AddTask([epoch]() { if (AsyncDispatch::IsSessionCurrent(epoch)) DispatchMaintenanceCall(true); });
                     }
                 }
                 break;
 
             case SKSE::MessagingInterface::kPostLoadGame:
+                if (!a_msg->data) {
+                    logger::warn("Load failed; pending work remains cancelled");
+                    break;
+                }
                 // Game loaded — SlotTracker already populated from co-save (LoadCallback).
                 // ClearAll moved to RevertCallback to avoid wiping co-save data.
                 logger::info("Game loaded - refreshing indexes, clearing MemoryDB caches");
                 NPCIndex::GetSingleton()->RefreshIndex();
                 MemoryDB::GetSingleton()->ClearCaches();
                 // Initialize per-save political DB (save ID restored via serialization)
-                if (g_hasReverted) {
-                    g_hasReverted = false;
-                    InitializePoliticalDB();
-                    FactionPolitics::GetSingleton()->Initialize();
-                }
-                // Re-sync SkyrimNet busy state from co-save-loaded SlotTracker
-                // (LoadCallback fires before SkyrimNet is ready, so we sync here)
-                {
-                    auto* tracker = SlotTracker::GetSingleton();
-                    if (tracker->HasCoSaveData() && SkyrimNetAPI::SetActorBusy) {
-                        for (int i = 0; i < MAX_SLOTS; ++i) {
-                            auto slot = tracker->GetSlotDataCopy(i);
-                            if (slot.state != 0 && slot.agentFormID) {
-                                auto reason = SlotTracker::BuildBusyReason(slot.taskType, slot.targetName);
-                                SkyrimNetAPI::SetActorBusy(slot.agentFormID, reason.c_str());
-                            }
-                        }
-                    }
-                }
+
+                InitializePoliticalDB();
+                // Political state remains readable; retired simulation is not initialized.
+                MemoryDB::GetSingleton()->RefreshEngineSnapshot();
+                AsyncDispatch::ResumeSession();
+                PersonalStories::ResumeSession();
+                // Legacy task busy state remains private; never overwrite another mod's busy reason.
                 // Fix stale script properties immediately (C++ only, no VM contention)
                 {
                     auto* task = SKSE::GetTaskInterface();
                     if (task) {
-                        task->AddTask([]() {
-                            FixupScriptProperties();
+                        const auto epoch = AsyncDispatch::CurrentSessionEpoch();
+                        task->AddTask([epoch]() {
+                            if (AsyncDispatch::IsSessionCurrent(epoch)) FixupScriptProperties();
                         });
                     }
                 }
@@ -427,30 +430,10 @@ namespace IntelEngine {
                 // Without this delay, IntelEngine's 9 concurrent VM dispatches caused
                 // contention that made RealNames' HasStringValue check fail intermittently.
                 {
-                    // Capture current load generation to detect stale dispatches
-                    // (player loads another save within the 3s window).
-                    uint32_t gen = SlotTracker::GetSingleton()->loadGeneration.load(
-                        std::memory_order_relaxed);
-                    std::thread([gen]() {
-                        std::this_thread::sleep_for(std::chrono::seconds(3));
-                        // Check if a new load/revert happened while we slept
-                        if (SlotTracker::GetSingleton()->loadGeneration.load(
-                                std::memory_order_relaxed) != gen) {
-                            logger::info("Deferred Maintenance cancelled (load generation changed)");
-                            return;
-                        }
-                        auto* deferredTask = SKSE::GetTaskInterface();
-                        if (deferredTask) {
-                            deferredTask->AddTask([gen]() {
-                                // Double-check on main thread too
-                                if (SlotTracker::GetSingleton()->loadGeneration.load(
-                                        std::memory_order_relaxed) != gen) {
-                                    return;
-                                }
-                                DispatchMaintenanceCall(false);
-                            });
-                        }
-                    }).detach();
+                    const auto epoch = AsyncDispatch::CurrentSessionEpoch();
+                    ProximityMonitor::GetSingleton()->DeferMaintenance([epoch]() {
+                        if (AsyncDispatch::IsSessionCurrent(epoch)) DispatchMaintenanceCall(false);
+                    });
                 }
                 break;
 
@@ -550,3 +533,9 @@ SKSEPluginLoad(const SKSE::LoadInterface* skse) {
     logger::info("IntelEngine loaded successfully");
     return true;
 }
+
+
+
+
+
+

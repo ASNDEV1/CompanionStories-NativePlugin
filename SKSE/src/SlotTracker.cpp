@@ -6,6 +6,7 @@
  */
 
 #include "SlotTracker.h"
+#include "SlotRecord.h"
 #include "SkyrimNetAPI.h"
 #include <chrono>
 #include <nlohmann/json.hpp>
@@ -24,14 +25,10 @@ namespace IntelEngine {
                                   const std::string& taskType, const std::string& targetName) {
         if (slot < 0 || slot >= MAX_SLOTS) return;
 
-        RE::FormID prevFormId = 0;
         RE::FormID newFormId = agent ? agent->GetFormID() : 0;
         {
             std::unique_lock lock(m_mutex);
             auto& s = m_slots[slot];
-            if (s.agent && s.agent != agent) {
-                prevFormId = s.agent->GetFormID();
-            }
             s.agent = agent;
             s.agentFormID = newFormId;
             s.state = state;
@@ -39,22 +36,7 @@ namespace IntelEngine {
             s.targetName = targetName;
         }
 
-        // SkyrimNet busy API calls outside lock (avoids lock ordering issues)
-        if (prevFormId && SkyrimNetAPI::ClearActorBusy) {
-            SkyrimNetAPI::ClearActorBusy(prevFormId);
-        }
-
-        // States where the NPC is idle (arrived, lingering, waiting) — clear busy so they
-        // can accept new tasks without the player needing to cancel first.
-        // State 1 = traveling, 3 = returning — these are active movement, keep busy.
-        // State 2 = waiting at dest, 5 = group wait, 8 = at-target interaction — idle, clear busy.
-        bool isIdleState = (state == 2 || state == 5 || state == 8 || state == 0);
-        if (newFormId && isIdleState && SkyrimNetAPI::ClearActorBusy) {
-            SkyrimNetAPI::ClearActorBusy(newFormId);
-        } else if (newFormId && !isIdleState && SkyrimNetAPI::SetActorBusy) {
-            auto reason = BuildBusyReason(taskType, targetName);
-            SkyrimNetAPI::SetActorBusy(newFormId, reason.c_str());
-        }
+        // Busy state stays in this task tracker: SkyrimNet's global API has no owner token.
 
         logger::debug("SlotTracker: Updated slot {} -> agent={}, state={}, type={}, target={}",
                      slot, agent ? agent->GetDisplayFullName() : "null", state, taskType, targetName);
@@ -63,13 +45,9 @@ namespace IntelEngine {
     void SlotTracker::ClearSlot(int slot) {
         if (slot < 0 || slot >= MAX_SLOTS) return;
 
-        RE::FormID busyFormId = 0;
         {
             std::unique_lock lock(m_mutex);
             auto& s = m_slots[slot];
-            if (s.agent) {
-                busyFormId = s.agent->GetFormID();
-            }
             s.agent = nullptr;
             s.agentFormID = 0;
             s.state = 0;
@@ -79,11 +57,6 @@ namespace IntelEngine {
             s.deadline = 0.0f;
             s.offscreenArrival = 0.0f;
             // Note: cooldown is NOT cleared here — it's per-actor, not per-slot
-        }
-
-        // Clear busy outside lock
-        if (busyFormId && SkyrimNetAPI::ClearActorBusy) {
-            SkyrimNetAPI::ClearActorBusy(busyFormId);
         }
 
         logger::debug("SlotTracker: Cleared slot {}", slot);
@@ -219,14 +192,10 @@ namespace IntelEngine {
     }
 
     void SlotTracker::ClearAll() {
-        // Collect busy actors under lock, then clear busy outside lock
-        std::vector<RE::FormID> busyFormIds;
+        // Save switching clears only our own volatile memory.
         {
             std::unique_lock lock(m_mutex);
             for (auto& s : m_slots) {
-                if (s.agent) {
-                    busyFormIds.push_back(s.agent->GetFormID());
-                }
                 s.agent = nullptr;
                 s.agentFormID = 0;
                 s.state = 0;
@@ -240,13 +209,7 @@ namespace IntelEngine {
             m_cooldowns.clear();
             m_hasCoSaveData.store(false, std::memory_order_release);
         }
-        // Clear SkyrimNet busy state outside lock (avoids lock ordering issues)
-        if (SkyrimNetAPI::ClearActorBusy) {
-            for (auto formId : busyFormIds) {
-                SkyrimNetAPI::ClearActorBusy(formId);
-            }
-        }
-        logger::info("SlotTracker: All slots cleared ({} busy states released)", busyFormIds.size());
+        logger::info("SlotTracker: Volatile task state cleared" );
     }
 
     std::string SlotTracker::BuildBusyReason(const std::string& taskType, const std::string& targetName) {
@@ -265,131 +228,81 @@ namespace IntelEngine {
     // --- Persistence ---
 
     static constexpr uint32_t SLOT_RECORD_TYPE = 'IETK';
-    static constexpr uint32_t SLOT_RECORD_VERSION = 1;
-
     void SlotTracker::Save(SKSE::SerializationInterface* a_intfc) {
-        if (!a_intfc->OpenRecord(SLOT_RECORD_TYPE, SLOT_RECORD_VERSION)) {
-            logger::error("SlotTracker::Save: Failed to open IETK record");
+        static_assert(MAX_SLOTS == Persistence::SLOT_COUNT);
+        std::array<Persistence::SavedSlot, Persistence::SLOT_COUNT> snapshot;
+        {
+            std::shared_lock lock(m_mutex);
+            for (size_t i = 0; i < snapshot.size(); ++i) {
+                const auto& s = m_slots[i];
+                snapshot[i] = {s.agentFormID, s.state, s.taskType, s.targetName,
+                    s.speed, s.deadline, s.offscreenArrival};
+            }
+        }
+        std::vector<unsigned char> bytes;
+        if (!Persistence::EncodeSlots(snapshot, bytes)) {
+            logger::error("SlotTracker::Save: Invalid runtime slot; no partial IETK record written");
             return;
         }
-
-        std::shared_lock lock(m_mutex);
-
-        int activeCount = 0;
-        for (int i = 0; i < MAX_SLOTS; ++i) {
-            const auto& s = m_slots[i];
-            // Serialize: slot index, formID, state, taskType, targetName, speed, deadline, offscreenArrival
-            uint32_t formID = s.agentFormID;
-            int32_t state = s.state;
-            int32_t speed = s.speed;
-            float deadline = s.deadline;
-            float offscreen = s.offscreenArrival;
-
-            a_intfc->WriteRecordData(&formID, sizeof(formID));
-            a_intfc->WriteRecordData(&state, sizeof(state));
-
-            uint32_t typeLen = static_cast<uint32_t>(s.taskType.size());
-            a_intfc->WriteRecordData(&typeLen, sizeof(typeLen));
-            if (typeLen > 0) a_intfc->WriteRecordData(s.taskType.data(), typeLen);
-
-            uint32_t nameLen = static_cast<uint32_t>(s.targetName.size());
-            a_intfc->WriteRecordData(&nameLen, sizeof(nameLen));
-            if (nameLen > 0) a_intfc->WriteRecordData(s.targetName.data(), nameLen);
-
-            a_intfc->WriteRecordData(&speed, sizeof(speed));
-            a_intfc->WriteRecordData(&deadline, sizeof(deadline));
-            a_intfc->WriteRecordData(&offscreen, sizeof(offscreen));
-
-            if (state != 0) activeCount++;
+        if (!a_intfc->OpenRecord(SLOT_RECORD_TYPE, Persistence::SLOT_RECORD_VERSION) ||
+            !a_intfc->WriteRecordData(bytes.data(), static_cast<uint32_t>(bytes.size()))) {
+            logger::error("SlotTracker::Save: Failed to write IETK record");
         }
-
-        logger::info("SlotTracker::Save: Wrote {} slots ({} active)", MAX_SLOTS, activeCount);
     }
 
-    void SlotTracker::Load(SKSE::SerializationInterface* a_intfc) {
-        // Phase 1: Read raw data from co-save (no lock needed — serialization is single-threaded)
-        struct RawSlot {
-            uint32_t formID = 0;
-            int32_t state = 0;
-            std::string taskType;
-            std::string targetName;
-            int32_t speed = 0;
-            float deadline = 0.0f;
-            float offscreen = 0.0f;
-        };
-        std::array<RawSlot, MAX_SLOTS> raw{};
-
-        for (int i = 0; i < MAX_SLOTS; ++i) {
-            auto& r = raw[i];
-            if (!a_intfc->ReadRecordData(&r.formID, sizeof(r.formID))) break;
-            if (!a_intfc->ReadRecordData(&r.state, sizeof(r.state))) break;
-
-            uint32_t typeLen = 0;
-            if (!a_intfc->ReadRecordData(&typeLen, sizeof(typeLen))) break;
-            if (typeLen > 0) {
-                if (typeLen >= 256) {
-                    logger::error("SlotTracker::Load: taskType length {} too large for slot {}, aborting", typeLen, i);
-                    break;
-                }
-                r.taskType.resize(typeLen);
-                if (!a_intfc->ReadRecordData(r.taskType.data(), typeLen)) break;
-            }
-
-            uint32_t nameLen = 0;
-            if (!a_intfc->ReadRecordData(&nameLen, sizeof(nameLen))) break;
-            if (nameLen > 0) {
-                if (nameLen >= 256) {
-                    logger::error("SlotTracker::Load: targetName length {} too large for slot {}, aborting", nameLen, i);
-                    break;
-                }
-                r.targetName.resize(nameLen);
-                if (!a_intfc->ReadRecordData(r.targetName.data(), nameLen)) break;
-            }
-
-            if (!a_intfc->ReadRecordData(&r.speed, sizeof(r.speed))) break;
-            if (!a_intfc->ReadRecordData(&r.deadline, sizeof(r.deadline))) break;
-            if (!a_intfc->ReadRecordData(&r.offscreen, sizeof(r.offscreen))) break;
+    void SlotTracker::Load(SKSE::SerializationInterface* a_intfc, uint32_t version, uint32_t length) {
+        if (m_hasCoSaveData.load(std::memory_order_acquire)) {
+            logger::error("SlotTracker::Load: Duplicate IETK record ignored");
+            return;
         }
-
-        // Phase 2: Resolve FormIDs and populate slots (engine calls outside lock)
+        if (version != Persistence::SLOT_RECORD_VERSION || length > Persistence::MAX_SLOT_RECORD_BYTES) {
+            logger::error("SlotTracker::Load: Unsupported IETK version/length ({}/{})", version, length);
+            return;
+        }
+        std::vector<unsigned char> bytes(length);
+        std::array<Persistence::SavedSlot, Persistence::SLOT_COUNT> raw;
+        if (a_intfc->ReadRecordData(bytes.data(), length) != length ||
+            !Persistence::DecodeSlots(bytes, version, raw)) {
+            logger::error("SlotTracker::Load: Invalid or truncated IETK; keeping legacy recovery available");
+            return;
+        }
+        // Decode and remap into temporary state. Nothing becomes authoritative
+        // until the entire versioned record is valid. Removed actors are skipped;
+        // existing plugin load-order changes are resolved by SKSE's mapping.
+        std::array<SlotData, MAX_SLOTS> restored{};
+        std::unordered_map<RE::FormID, bool> seenActors;
         int recovered = 0;
         for (int i = 0; i < MAX_SLOTS; ++i) {
             const auto& r = raw[i];
-            if (r.formID == 0 || r.state == 0) continue;
-
-            uint32_t resolvedFormID = 0;
-            if (!a_intfc->ResolveFormID(r.formID, resolvedFormID)) {
-                logger::warn("SlotTracker::Load: Failed to resolve FormID {:X} for slot {}", r.formID, i);
+            if (r.state == 0) continue;
+            uint32_t formID = 0;
+            if (!a_intfc->ResolveFormID(r.formID, formID)) {
+                logger::warn("SlotTracker::Load: Missing actor form {:X} in slot {}", r.formID, i);
                 continue;
             }
-
-            auto* actor = RE::TESForm::LookupByID<RE::Actor>(resolvedFormID);
-            if (!actor || actor->IsDead()) {
-                logger::warn("SlotTracker::Load: Actor {:X} not found or dead for slot {}", resolvedFormID, i);
-                continue;
+            auto* actor = RE::TESForm::LookupByID<RE::Actor>(formID);
+            if (!actor || actor->IsDead()) continue;
+            if (!seenActors.emplace(formID, true).second) {
+                logger::error("SlotTracker::Load: Actor {:X} occurs in multiple slots; rejecting record", formID);
+                return;
             }
-
-            // Write to slot under lock
-            {
-                std::unique_lock lock(m_mutex);
-                auto& s = m_slots[i];
-                s.agent = actor;
-                s.agentFormID = resolvedFormID;
-                s.state = r.state;
-                s.taskType = r.taskType;
-                s.targetName = r.targetName;
-                s.speed = r.speed;
-                s.deadline = r.deadline;
-                s.offscreenArrival = r.offscreen;
-            }
-            recovered++;
-
-            logger::info("SlotTracker::Load: Recovered slot {} -> {} ({}), state={}, target={}",
-                        i, actor->GetDisplayFullName(), r.taskType, r.state, r.targetName);
+            auto& s = restored[i];
+            s.agent = actor;
+            s.agentFormID = formID;
+            s.state = r.state;
+            s.taskType = r.taskType;
+            s.targetName = r.targetName;
+            s.speed = r.speed;
+            s.deadline = r.deadline;
+            s.offscreenArrival = r.offscreen;
+            ++recovered;
         }
-
-        m_hasCoSaveData.store(true, std::memory_order_release);
-        logger::info("SlotTracker::Load: Recovered {} active slots from co-save", recovered);
+        {
+            std::unique_lock lock(m_mutex);
+            m_slots = std::move(restored);
+            m_hasCoSaveData.store(true, std::memory_order_release);
+        }
+        logger::info("SlotTracker::Load: Atomically recovered {} task slots", recovered);
     }
 
     // --- Per-field setters ---
@@ -413,3 +326,5 @@ namespace IntelEngine {
     }
 
 }  // namespace IntelEngine
+
+

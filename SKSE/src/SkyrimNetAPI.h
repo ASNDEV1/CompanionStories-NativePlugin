@@ -38,6 +38,9 @@ namespace IntelEngine::SkyrimNetAPI {
 
     // ---- Core ----
     inline int (*GetVersion)() = nullptr;
+    inline bool (*RegisterCPPAction)(const std::string, const std::string,
+        std::function<bool(RE::Actor*)>, std::function<bool(RE::Actor*, std::string)>,
+        const std::string, std::string, int, std::string, std::string, std::string, std::string) = nullptr;
 
     // ---- Bio Template (v3+) ----
 
@@ -138,6 +141,8 @@ namespace IntelEngine::SkyrimNetAPI {
 
         GetVersion = reinterpret_cast<int(*)()>(
             GetProcAddress(hDLL, "PublicGetVersion"));
+        RegisterCPPAction = reinterpret_cast<decltype(RegisterCPPAction)>(
+            GetProcAddress(hDLL, "PublicRegisterCPPAction"));
 
         if (!GetVersion) {
             logger::warn("SkyrimNet found but PublicGetVersion not exported — old version?");

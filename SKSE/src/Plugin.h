@@ -10,7 +10,7 @@
 #include <SKSE/SKSE.h>
 #include <spdlog/sinks/basic_file_sink.h>
 
-#define INTELENGINE_VERSION "3.5.0"
+#define INTELENGINE_VERSION "0.1.0"
 
 using namespace std::literals;
 
@@ -31,3 +31,4 @@ namespace IntelEngine {
     };
     QuestHandleResult ResolveQuestHandle(bool startIfStopped = false);
 }
+

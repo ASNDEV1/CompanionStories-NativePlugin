@@ -1065,7 +1065,7 @@ EndEvent
 ; same state machine as the 3s poll evaluates arrival — arming covers
 ; outbound-to-target (state 1) and returning-with-target (state 3).
 Function OnProximityArrived(String slotStr)
-    Int slot = slotStr as Int
+    Int slot = IntelEngine.ConsumeProximityReceipt(slotStr)
     If slot < 0 || slot >= Core.MAX_SLOTS
         Return
     EndIf

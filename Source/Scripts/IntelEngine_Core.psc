@@ -208,12 +208,9 @@ Function Maintenance(Bool isFirstLoad = false)
     LastMaintenanceRealTime = now
     DebugMsg("IntelEngine Maintenance (firstLoad=" + isFirstLoad + ")")
 
-    ; On first install (new game), clear all StorageUtil data from previous sessions.
-    ; StorageUtil persists outside the save system, so stale data from other saves
-    ; would otherwise bleed into the new game.
+    ; StorageUtil belongs to the loaded save. Never erase existing state merely
+    ; because a first-install event also fired during maintenance.
     If isFirstLoad
-        Int cleared = StorageUtil.ClearAllPrefix("Intel_")
-        DebugMsg("Cleared " + cleared + " stale StorageUtil keys")
 
         ; MCM defaults — enabled by default on fresh install
         Actor player = Game.GetPlayer()
@@ -292,7 +289,9 @@ Function Maintenance(Bool isFirstLoad = false)
         EndIf
     EndIf
 
-    ; Restart monitoring loops on all task scripts.
+    RetireLegacyAutomation()
+
+    ; Restart monitoring loops on remaining internal task helpers.
     ; RegisterForSingleUpdate is per-script and does NOT survive save/load,
     ; so we must explicitly restart each script's update loop here.
     If Travel
@@ -303,16 +302,6 @@ Function Maintenance(Bool isFirstLoad = false)
     EndIf
     If Schedule
         Schedule.RestartMonitoring()
-    EndIf
-    If StoryEngine
-        StoryEngine.RestartMonitoring()
-        StoryEngine.StartScheduler()
-    EndIf
-    If Politics
-        Politics.Maintenance()
-    EndIf
-    If Battle
-        Battle.OnGameReload()
     EndIf
 
     ; Clean expired facts on subsequent loads
@@ -665,6 +654,11 @@ Function ClearSlot(Int slot, Bool restoreNPC = true, Bool intelPackagesOnly = fa
             StorageUtil.UnsetFloatValue(agent, "Intel_WaitHours")
             StorageUtil.UnsetIntValue(agent, "Intel_WaitForPlayer")
             StorageUtil.UnsetFloatValue(agent, "Intel_Deadline")
+            ; Legacy tasks did clear teammate state. Restore only with their recorded
+            ; pre-task ownership evidence; new tasks never write this key.
+            If StorageUtil.GetIntValue(agent, "Intel_WasFollower", 0) == 1
+                agent.SetPlayerTeammate(true)
+            EndIf
             StorageUtil.UnsetIntValue(agent, "Intel_WasFollower")
 
             ; Clear fetch/deliver/escort task data
@@ -742,7 +736,7 @@ Function ClearSlot(Int slot, Bool restoreNPC = true, Bool intelPackagesOnly = fa
 
             ; Restore courier aggression if it was modified
             Float origAggr = StorageUtil.GetFloatValue(agent, "Intel_OrigAggression", -1.0)
-            If origAggr >= 0.0
+            If origAggr >= 0.0 && agent.GetActorValue("Aggression") == 0.0
                 agent.SetActorValue("Aggression", origAggr)
                 StorageUtil.UnsetFloatValue(agent, "Intel_OrigAggression")
             EndIf
@@ -891,16 +885,8 @@ Function SetSlotDeadline(Int slot, Float deadline)
 EndFunction
 
 Function ClearSlotRestoreFollower(Int slot, Actor akAgent)
-    {Clear a task slot and restore follower status if the agent was a follower.
-    Reads Intel_WasFollower BEFORE ClearSlot wipes it, then restores teammate.
-    For followers: only removes IntelEngine packages, preserving NFF/SkyrimNet
-    follow packages so the NPC resumes following without needing a re-kick.}
-    Bool wasFollower = StorageUtil.GetIntValue(akAgent, "Intel_WasFollower") as Bool
-    ClearSlot(slot, true, wasFollower)
-    If wasFollower
-        akAgent.SetPlayerTeammate(true)
-        akAgent.EvaluatePackage()
-    EndIf
+    {Compatibility entry point; every terminal path performs the same cleanup.}
+    ClearSlot(slot, true, true)
 EndFunction
 
 Function MarkSlotProcessing(Int slot, Actor akAgent)
@@ -910,10 +896,7 @@ Function MarkSlotProcessing(Int slot, Actor akAgent)
     If slot < 0 || slot >= MAX_SLOTS
         Return
     EndIf
-    SlotStates[slot] = 0
-    If akAgent != None
-        StorageUtil.SetIntValue(akAgent, "Intel_State", 0)
-    EndIf
+    SetSlotState(slot, akAgent, 0)
 EndFunction
 
 ; =============================================================================
@@ -1031,36 +1014,9 @@ Function OverrideExistingTask(Actor npc)
 EndFunction
 
 Function DismissFollowerForTask(Actor npc)
-    {Prepare NPC for a new IntelEngine task by clearing ALL package overrides.
-
-    Uses ActorUtil.ClearPackageOverride to remove overrides from ALL sources —
-    IntelEngine, SkyrimNet (companion follow, TalkToPlayer), and any other mod.
-    IntelEngine's task functions (GoToLocation, FetchNPC, etc.) immediately apply
-    their own packages after this call, so the NPC is never left without overrides.
-
-    Why blanket clear instead of removing specific packages:
-    SkyrimNet's companion follow system uses its own package overrides that are
-    invisible to IntelEngine. SetPlayerTeammate(false) only clears the vanilla
-    follower flag — SkyrimNet's follow package stays active and overrides the
-    travel package, causing the NPC to follow the player instead of traveling.
-    Diagnosed via Ingrid's Western Watchtower trip where she followed the player
-    for 1.5 hours instead of walking to the destination, with no stuck detection
-    (she was moving, just not toward the destination).
-
-    Note: EvaluatePackage is NOT called here — callers apply their own packages
-    first, then evaluate. This prevents a brief gap where the NPC has no overrides
-    and reverts to default AI.}
-
-    ; Clear ALL package overrides from all sources
-    ActorUtil.ClearPackageOverride(npc)
-    DebugMsg("Cleared all package overrides for " + npc.GetDisplayName())
-
-    ; Also clear vanilla follower state so the engine doesn't re-apply follow AI
-    If npc.IsPlayerTeammate()
-        StorageUtil.SetIntValue(npc, "Intel_WasFollower", 1)
-        npc.SetPlayerTeammate(false)
-        DebugMsg("Dismissed follower: " + npc.GetDisplayName())
-    EndIf
+    {Legacy public entry point. Release only our own packages before assigning a task.
+    Follower frameworks retain teammate state and their own package overrides.}
+    RemoveIntelPackages(npc, false)
 EndFunction
 
 Int Function ShowTaskConfirmation(Actor npc, String promptText)
@@ -1259,15 +1215,8 @@ Function SoftStuckRecovery(Actor npc, Int slot, ObjectReference dest)
 EndFunction
 
 Function RemoveAllPackages(Actor akActor, Bool evaluate = true)
-    ; Clear ALL package overrides from any source (IntelEngine, SkyrimNet, etc.)
-    ; WARNING: This strips packages from ALL mods. Only use on task agents that
-    ; IntelEngine fully owns. For targets (fetched/escorted NPCs), use
-    ; RemoveIntelPackages() instead to preserve SkyrimNet packages.
-    ; Pass evaluate=false when adding a new package immediately after (prevents brief base-AI gap)
-    ActorUtil.ClearPackageOverride(akActor)
-    If evaluate
-        akActor.EvaluatePackage()
-    EndIf
+    {Compatibility entry point: package cleanup is always scoped to IntelEngine.}
+    RemoveIntelPackages(akActor, evaluate)
 EndFunction
 
 Function RemoveIntelPackages(Actor akActor, Bool evaluate = true)
@@ -1275,6 +1224,9 @@ Function RemoveIntelPackages(Actor akActor, Bool evaluate = true)
     mods (SkyrimNet FollowPlayer, SeverAction, etc.). Use this for target NPCs
     that IntelEngine doesn't fully own via a task slot.
     Pass evaluate=false when adding a new package immediately after.}
+    If akActor == None
+        Return
+    EndIf
     ActorUtil.RemovePackageOverride(akActor, TravelPackage_Walk)
     ActorUtil.RemovePackageOverride(akActor, TravelPackage_Jog)
     ActorUtil.RemovePackageOverride(akActor, TravelPackage_Run)
@@ -1535,6 +1487,7 @@ Function InjectGossip(Actor akGiver, Actor akReceiver, String gossipText)
     gossipText: Past-tense verb phrase, e.g., "heard that the Jarl is raising taxes"
     Both NPCs track who told/received the gossip (5-entry rolling cap).
     Renders in "Rumors I've Heard" bio section, separate from personal facts.}
+    Return ; SkyrimNet owns dynamic biography and gossip initiation.
     If akGiver == None || akReceiver == None || gossipText == ""
         Return
     EndIf
@@ -1916,24 +1869,12 @@ EndFunction
 ; =============================================================================
 
 Function RegisterDashboardEvents()
-    RegisterForModEvent("IntelEngine_DashboardOpened", "OnDashboardOpened")
-    RegisterForModEvent("IntelEngine_DashboardRefresh", "OnDashboardRefresh")
-    RegisterForModEvent("IntelEngine_DashboardCancelTask", "OnDashboardCancelTask")
-    RegisterForModEvent("IntelEngine_DashboardCancelQuest", "OnDashboardCancelQuest")
-    RegisterForModEvent("IntelEngine_DashboardCancelSchedule", "OnDashboardCancelSchedule")
-    RegisterForModEvent("IntelEngine_DashboardToggleStory", "OnDashboardToggleStory")
-    RegisterForModEvent("IntelEngine_DashboardSetting", "OnDashboardSetting")
-    RegisterForModEvent("IntelEngine_DashboardRemovePackages", "OnDashboardRemovePackages")
-    RegisterForModEvent("IntelEngine_DashboardDispatchStory", "OnDashboardDispatchStory")
-    RegisterForModEvent("IntelEngine_DashboardDispatchNpcSocial", "OnDashboardDispatchNpcSocial")
-    RegisterForModEvent("IntelEngine_DashboardDispatchPolitics", "OnDashboardDispatchPolitics")
-    RegisterForModEvent("IntelEngine_DashboardExecuteAction", "OnDashboardExecuteAction")
-    RegisterForModEvent("IntelEngine_AutoBioUpdate", "OnAutoBioUpdate")
-    RegisterForModEvent("IntelEngine_SaveBioCount", "OnSaveBioCount")
-    DebugMsg("Dashboard ModEvent listeners registered")
+    ; Legacy dashboard/bio automation is retired. Clear saved registrations.
+    UnregisterForAllModEvents()
 EndFunction
 
 Event OnSaveBioCount(String eventName, String strArg, Float numArg, Form sender)
+    Return ; Legacy automatic/public UI entry point retired.
     ; sender = Actor, strArg = count as string
     Actor npc = sender as Actor
     If npc == None || StoryEngine == None
@@ -1947,6 +1888,7 @@ Event OnSaveBioCount(String eventName, String strArg, Float numArg, Form sender)
 EndEvent
 
 Event OnAutoBioUpdate(String eventName, String strArg, Float numArg, Form sender)
+    Return ; Legacy automatic/public UI entry point retired.
     ; sender = Actor — no FormID encoding needed, works for all actors including mod-added
     Actor npc = sender as Actor
     If npc == None
@@ -1965,14 +1907,17 @@ Event OnAutoBioUpdate(String eventName, String strArg, Float numArg, Form sender
 EndEvent
 
 Event OnDashboardOpened(String eventName, String strArg, Float numArg, Form sender)
+    Return ; Legacy automatic/public UI entry point retired.
     PushDashboardState()
 EndEvent
 
 Event OnDashboardRefresh(String eventName, String strArg, Float numArg, Form sender)
+    Return ; Legacy automatic/public UI entry point retired.
     PushDashboardState()
 EndEvent
 
 Event OnDashboardCancelTask(String eventName, String strArg, Float numArg, Form sender)
+    Return ; Legacy automatic/public UI entry point retired.
     Int slot = numArg as Int
     If slot >= 0 && slot < MAX_SLOTS
         Actor agent = GetAgentAlias(slot).GetActorReference()
@@ -1986,6 +1931,7 @@ Event OnDashboardCancelTask(String eventName, String strArg, Float numArg, Form 
 EndEvent
 
 Event OnDashboardCancelQuest(String eventName, String strArg, Float numArg, Form sender)
+    Return ; Legacy automatic/public UI entry point retired.
     If StoryEngine != None && StoryEngine.QuestActive
         DebugMsg("Dashboard: Cancelling active quest")
         StoryEngine.CleanupQuest()
@@ -1995,6 +1941,7 @@ Event OnDashboardCancelQuest(String eventName, String strArg, Float numArg, Form
 EndEvent
 
 Event OnDashboardRemovePackages(String eventName, String strArg, Float numArg, Form sender)
+    Return ; Legacy automatic/public UI entry point retired.
     Int formId = numArg as Int
     Actor npc = Game.GetForm(formId) as Actor
     If npc != None
@@ -2022,6 +1969,7 @@ Event OnDashboardRemovePackages(String eventName, String strArg, Float numArg, F
 EndEvent
 
 Event OnDashboardCancelSchedule(String eventName, String strArg, Float numArg, Form sender)
+    Return ; Legacy automatic/public UI entry point retired.
     Int slot = numArg as Int
     If Schedule
         Schedule.ClearScheduleSlot(slot)
@@ -2031,6 +1979,7 @@ Event OnDashboardCancelSchedule(String eventName, String strArg, Float numArg, F
 EndEvent
 
 Event OnDashboardToggleStory(String eventName, String strArg, Float numArg, Form sender)
+    Return ; Legacy automatic/public UI entry point retired.
     If !StoryEngine
         Return
     EndIf
@@ -2061,6 +2010,7 @@ Event OnDashboardToggleStory(String eventName, String strArg, Float numArg, Form
 EndEvent
 
 Event OnDashboardSetting(String eventName, String strArg, Float numArg, Form sender)
+    Return ; Legacy automatic/public UI entry point retired.
     DebugMsg("Dashboard: Setting " + strArg + " = " + numArg)
 
     ; Use centralized setters (same ones MCM calls) for single source of truth
@@ -2250,6 +2200,7 @@ EndEvent
 ; DIRECTOR MODE: Story Dispatch
 ; =============================================================================
 Event OnDashboardDispatchStory(String eventName, String strArg, Float numArg, Form sender)
+    Return ; Legacy automatic/public UI entry point retired.
     ; strArg = full JSON payload (race-safe: no shared state between C++ and Papyrus)
     String storyType = IntelEngine.StoryResponseGetField(strArg, "storyType")
     String npcName = IntelEngine.StoryResponseGetField(strArg, "npcName")
@@ -2327,6 +2278,7 @@ EndEvent
 ; DIRECTOR MODE: NPC Social Dispatch
 ; =============================================================================
 Event OnDashboardDispatchNpcSocial(String eventName, String strArg, Float numArg, Form sender)
+    Return ; Legacy automatic/public UI entry point retired.
     ; strArg = socialType (npc_interaction or npc_gossip)
     ; strArg = full JSON payload (race-safe: no shared state between C++ and Papyrus)
     String socialType = IntelEngine.StoryResponseGetField(strArg, "socialType")
@@ -2385,6 +2337,7 @@ EndEvent
 ; DIRECTOR MODE: Political Event Dispatch
 ; =============================================================================
 Event OnDashboardDispatchPolitics(String eventName, String strArg, Float numArg, Form sender)
+    Return ; Legacy automatic/public UI entry point retired.
     ; strArg = fake Political DM response JSON (built by C++ from UI fields)
     ; Feed it directly to ProcessPoliticalDMResponse — same path as a real DM response
     DebugMsg("Director: Political event received — eventName=" + eventName + " strArg length=" + StringUtil.GetLength(strArg))
@@ -2404,6 +2357,7 @@ EndEvent
 ; DIRECTOR MODE: Action Execution
 ; =============================================================================
 Event OnDashboardExecuteAction(String eventName, String strArg, Float numArg, Form sender)
+    Return ; Legacy automatic/public UI entry point retired.
     ; strArg = full JSON payload (race-safe), numArg = npcFormId
     String actionName = IntelEngine.StoryResponseGetField(strArg, "actionName")
     Actor npc = Game.GetForm(numArg as Int) as Actor
@@ -2779,3 +2733,34 @@ EndFunction
 
 IntelEngine_Politics Property Politics  Auto
 IntelEngine_Battle Property Battle Auto
+
+Function RetireLegacyAutomation()
+    {The follower-project fork retires conflicting automatic world simulation.
+    Scripts remain attached under their released names for save compatibility.}
+    If StoryEngine != None
+        StoryEngine.RetireAutomation()
+    EndIf
+    If Politics != None
+        Politics.RetireAutomation()
+    EndIf
+    If Battle != None
+        Battle.RetireAutomation()
+    EndIf
+EndFunction
+
+Int Function FindOwnedAliasForCleanup(Actor npc)
+    {Cleanup-only lookup includes a saved processing slot whose state is zero.
+    Matching the quest-owned alias establishes actor ownership without guessing.}
+    If npc == None
+        Return -1
+    EndIf
+    Int slot = 0
+    While slot < MAX_SLOTS
+        ReferenceAlias ownedAlias = GetAgentAlias(slot)
+        If ownedAlias != None && ownedAlias.GetActorReference() == npc
+            Return slot
+        EndIf
+        slot += 1
+    EndWhile
+    Return -1
+EndFunction

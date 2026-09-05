@@ -36,6 +36,111 @@
 
 namespace IntelEngine::Papyrus {
 
+    int ConsumeProximityReceipt(RE::StaticFunctionTag*, RE::BSFixedString receipt) {
+        return ProximityMonitor::GetSingleton()->ConsumeReceipt(receipt.c_str());
+    }
+
+    namespace {
+        nlohmann::json TokenJson(AsyncDispatch::RequestToken token) {
+            return {{"epoch", token.epoch}, {"sequence", token.sequence}, {"lane", static_cast<int>(token.lane)}};
+        }
+        AsyncDispatch::RequestToken ReadToken(const nlohmann::json& value) {
+            const auto& token = value.at("_intel_dispatch");
+            const int lane = token.at("lane").get<int>();
+            if (lane < 0 || lane > 2) return {};
+            return {token.at("epoch").get<std::uint64_t>(), token.at("sequence").get<std::uint64_t>(),
+                static_cast<AsyncDispatch::Lane>(lane)};
+        }
+        std::string SessionEnvelope(AsyncDispatch::RequestToken token, const std::string& response) {
+            return nlohmann::json{{"_intel_dispatch", TokenJson(token)}, {"response", response}}.dump();
+        }
+        void DeliverContext(AsyncDispatch::RequestToken token, const std::string& quest,
+                            const std::string& script, const std::string& function, std::string context) {
+            if (!AsyncDispatch::IsCurrent(token)) return;
+            try {
+                if (!context.empty()) {
+                    auto json = nlohmann::json::parse(context);
+                    json["_intel_dispatch"] = TokenJson(token);
+                    context = json.dump();
+                }
+                AsyncDispatch::ExecuteQuestFunctionString(quest, script, function, SessionEnvelope(token, context));
+            } catch (const std::exception& error) {
+                logger::error("DeliverContext: {}", error.what());
+            }
+        }
+    }
+
+    bool IsCurrentSessionResponse(RE::StaticFunctionTag*, RE::BSFixedString envelope) {
+        try { return AsyncDispatch::IsCurrent(ReadToken(nlohmann::json::parse(envelope.c_str()))); }
+        catch (...) { return false; }
+    }
+
+    RE::BSFixedString UnwrapSessionResponse(RE::StaticFunctionTag*, RE::BSFixedString envelope) {
+        try {
+            auto json = nlohmann::json::parse(envelope.c_str());
+            if (!AsyncDispatch::IsCurrent(ReadToken(json))) return RE::BSFixedString("");
+            return RE::BSFixedString(json.at("response").get<std::string>().c_str());
+        } catch (...) { return RE::BSFixedString(""); }
+    }
+
+    int SendSessionPrompt(RE::StaticFunctionTag*, RE::BSFixedString promptName,
+                          RE::BSFixedString variant, RE::BSFixedString contextJson,
+                          RE::TESQuest* callbackQuest, RE::BSFixedString callbackScript,
+                          RE::BSFixedString callbackFn) {
+        try {
+            auto context = nlohmann::json::parse(contextJson.c_str());
+            const auto token = ReadToken(context);
+            if (!AsyncDispatch::IsCurrent(token) || !callbackQuest) return -1;
+            const char* editorID = callbackQuest->GetFormEditorID();
+            if (!editorID || !editorID[0]) return -1;
+            using SendPrompt = bool (*)(const char*, const char*, const char*, std::function<void(const char*, int)>);
+            const auto module = GetModuleHandleA("SkyrimNet.dll");
+            const auto send = module ? reinterpret_cast<SendPrompt>(GetProcAddress(module, "PublicSendCustomPromptToLLM")) : nullptr;
+            if (!send) return -1;
+            context.erase("_intel_dispatch");
+            const auto payload = context.dump();
+            return send(promptName.c_str(), variant.c_str(), payload.c_str(),
+                [token, quest = std::string(editorID), script = std::string(callbackScript.c_str()),
+                 function = std::string(callbackFn.c_str())](const char* response, int success) {
+                    try {
+                        if (!AsyncDispatch::IsCurrent(token)) return;
+                        auto envelope = SessionEnvelope(token, response ? response : "");
+                        auto* tasks = SKSE::GetTaskInterface();
+                        if (!tasks) return;
+                        tasks->AddTask([token, quest, script, function, envelope = std::move(envelope), success]() {
+                            if (!AsyncDispatch::IsCurrent(token)) return;
+                            AsyncDispatch::ExecuteQuestFunctionResponse(quest, script, function, envelope, success);
+                        });
+                    } catch (const std::exception& error) {
+                        logger::error("SendSessionPrompt callback: {}", error.what());
+                    }
+                }) ? 0 : -1;
+        } catch (const std::exception& error) {
+            logger::warn("SendSessionPrompt: {}", error.what());
+            return -1;
+        }
+    }
+
+    bool GetActorEssentialFlag(RE::StaticFunctionTag*, RE::Actor* actor) {
+        return actor && actor->GetActorRuntimeData().boolFlags.all(RE::Actor::BOOL_FLAGS::kEssential);
+    }
+    void SetActorEssentialFlag(RE::StaticFunctionTag*, RE::Actor* actor, bool essential) {
+        if (!actor) return;
+        auto& flags = actor->GetActorRuntimeData().boolFlags;
+        if (essential) flags.set(RE::Actor::BOOL_FLAGS::kEssential);
+        else flags.reset(RE::Actor::BOOL_FLAGS::kEssential);
+    }
+    bool GetActorNoBleedoutRecovery(RE::StaticFunctionTag*, RE::Actor* actor) {
+        return actor && actor->GetActorRuntimeData().boolFlags.all(RE::Actor::BOOL_FLAGS::kNoBleedoutRecovery);
+    }
+    bool GetActorDontMove(RE::StaticFunctionTag*, RE::Actor* actor) {
+        return actor && actor->GetActorRuntimeData().boolFlags.all(RE::Actor::BOOL_FLAGS::kMovementBlocked);
+    }
+    bool GetActorRestrained(RE::StaticFunctionTag*, RE::Actor* actor) {
+        return actor && actor->AsActorState() &&
+            actor->AsActorState()->GetLifeState() == RE::ACTOR_LIFE_STATE::kRestrained;
+    }
+
     // Forward declarations for functions defined after Register()
     void MarkSystemPending(RE::StaticFunctionTag*, RE::BSFixedString, float);
     void ClearSystemPending(RE::StaticFunctionTag*, RE::BSFixedString);
@@ -367,6 +472,15 @@ namespace IntelEngine::Papyrus {
         a_vm->RegisterFunction("BuildNPCInteractionContext", SCRIPT_NAME, BuildNPCInteractionContext); ++count;
         a_vm->RegisterFunction("BuildNPCInteractionRequestJson", SCRIPT_NAME, BuildNPCInteractionRequestJson); ++count;
         a_vm->RegisterFunction("BeginAsyncNPCDMTick", SCRIPT_NAME, BeginAsyncNPCDMTick); ++count;
+        a_vm->RegisterFunction("SendSessionPrompt", SCRIPT_NAME, SendSessionPrompt); ++count;
+        a_vm->RegisterFunction("ConsumeProximityReceipt", SCRIPT_NAME, ConsumeProximityReceipt); ++count;
+        a_vm->RegisterFunction("GetActorEssentialFlag", SCRIPT_NAME, GetActorEssentialFlag); ++count;
+        a_vm->RegisterFunction("SetActorEssentialFlag", SCRIPT_NAME, SetActorEssentialFlag); ++count;
+        a_vm->RegisterFunction("GetActorNoBleedoutRecovery", SCRIPT_NAME, GetActorNoBleedoutRecovery); ++count;
+        a_vm->RegisterFunction("GetActorDontMove", SCRIPT_NAME, GetActorDontMove); ++count;
+        a_vm->RegisterFunction("GetActorRestrained", SCRIPT_NAME, GetActorRestrained); ++count;
+        a_vm->RegisterFunction("IsCurrentSessionResponse", SCRIPT_NAME, IsCurrentSessionResponse); ++count;
+        a_vm->RegisterFunction("UnwrapSessionResponse", SCRIPT_NAME, UnwrapSessionResponse); ++count;
         a_vm->RegisterFunction("BeginAsyncStoryDMTick", SCRIPT_NAME, BeginAsyncStoryDMTick); ++count;
         a_vm->RegisterFunction("BeginAsyncPoliticalTick", SCRIPT_NAME, BeginAsyncPoliticalTick); ++count;
         a_vm->RegisterFunction("NotifyStoryCooldown", SCRIPT_NAME, NotifyStoryCooldown); ++count;
@@ -954,8 +1068,10 @@ namespace IntelEngine::Papyrus {
         int bestNameScore = 999;
 
         // Iterate through cell references
-        // Note: CommonLibSSE-NG ForEachReference takes TESObjectREFR& (reference), not pointer
-        cell->ForEachReference([&](RE::TESObjectREFR& ref) -> RE::BSContainer::ForEachResult {
+        // CommonLibSSE-NG supplies a reference pointer; ignore null entries.
+        cell->ForEachReference([&](RE::TESObjectREFR* referencePtr) -> RE::BSContainer::ForEachResult {
+            if (!referencePtr) return RE::BSContainer::ForEachResult::kContinue;
+            auto& ref = *referencePtr;
             if (&ref == akActor) {
                 return RE::BSContainer::ForEachResult::kContinue;
             }
@@ -1654,7 +1770,9 @@ namespace IntelEngine::Papyrus {
         auto markerPos = questLocation->GetPosition();
         bool found = false;
 
-        cell->ForEachReference([&](RE::TESObjectREFR& doorRef) {
+        cell->ForEachReference([&](RE::TESObjectREFR* referencePtr) {
+            if (!referencePtr) return RE::BSContainer::ForEachResult::kContinue;
+            auto& doorRef = *referencePtr;
             if (found) return RE::BSContainer::ForEachResult::kStop;
             if (doorRef.IsDisabled()) return RE::BSContainer::ForEachResult::kContinue;
 
@@ -2065,6 +2183,9 @@ namespace IntelEngine::Papyrus {
                               RE::TESQuest* callbackQuest,
                               RE::BSFixedString callbackScript,
                               RE::BSFixedString callbackFn) {
+        const auto token = AsyncDispatch::BeginRequest(AsyncDispatch::Lane::NPC);
+        if (!AsyncDispatch::IsCurrent(token)) return;
+        MemoryDB::GetSingleton()->RefreshEngineSnapshot();
         if (!callbackQuest) {
             logger::error("BeginAsyncNPCDMTick: null callback quest");
             return;
@@ -2086,16 +2207,18 @@ namespace IntelEngine::Papyrus {
 
         // If snapshot has nothing, fire empty callback inline (already main thread).
         if (snap.candidates.empty()) {
-            AsyncDispatch::ExecuteQuestFunctionString(questEditorId, scriptName, functionName, "");
+            DeliverContext(token, questEditorId, scriptName, functionName, "");
             return;
         }
 
         // Phase B — worker thread: build context + JSON, then marshal back for callback.
-        AsyncDispatch::Submit([snap = std::move(snap), playerAtInn,
+        AsyncDispatch::Submit(token, [token, snap = std::move(snap), playerAtInn,
                                questEditorId = std::move(questEditorId),
                                scriptName = std::move(scriptName),
                                functionName = std::move(functionName)]() mutable {
-            std::string md = NPCIndex::GetSingleton()->BuildNPCInteractionContextFromSnapshot(snap);
+                if (!AsyncDispatch::IsCurrent(token)) return;
+            NPCIndex::CandidatePool pool;
+            std::string md = NPCIndex::GetSingleton()->BuildNPCInteractionContextFromSnapshot(snap, pool);
             std::string requestJson;
             if (!md.empty()) {
                 requestJson = BuildNPCInteractionRequestJsonCore(md, playerAtInn, snap.currentGameTime);
@@ -2106,11 +2229,13 @@ namespace IntelEngine::Papyrus {
                 logger::error("BeginAsyncNPCDMTick: TaskInterface unavailable, callback dropped");
                 return;
             }
-            task->AddTask([questEditorId = std::move(questEditorId),
+            task->AddTask([token, questEditorId = std::move(questEditorId),
                            scriptName = std::move(scriptName),
                            functionName = std::move(functionName),
-                           requestJson = std::move(requestJson)]() mutable {
-                AsyncDispatch::ExecuteQuestFunctionString(questEditorId, scriptName, functionName, requestJson);
+                           requestJson = std::move(requestJson), pool = std::move(pool)]() mutable {
+                if (!AsyncDispatch::IsCurrent(token)) return;
+                NPCIndex::GetSingleton()->PublishCandidatePool(true, std::move(pool));
+                DeliverContext(token, questEditorId, scriptName, functionName, requestJson);
             });
         });
     }
@@ -2639,6 +2764,9 @@ namespace IntelEngine::Papyrus {
                                 RE::TESQuest* callbackQuest,
                                 RE::BSFixedString callbackScript,
                                 RE::BSFixedString callbackFn) {
+        const auto token = AsyncDispatch::BeginRequest(AsyncDispatch::Lane::Story);
+        if (!AsyncDispatch::IsCurrent(token)) return;
+        MemoryDB::GetSingleton()->RefreshEngineSnapshot();
         if (!callbackQuest) {
             logger::error("BeginAsyncStoryDMTick: null callback quest");
             return;
@@ -2658,10 +2786,11 @@ namespace IntelEngine::Papyrus {
 
         // Phase 0 — worker thread: SQL prefetch (GetActorEngagement + GetPlayerContext).
         // Phase A then runs on main thread once prefetch is ready.
-        AsyncDispatch::Submit([maxC, absenceDays, excludedStr = std::move(excludedStr),
+        AsyncDispatch::Submit(token, [token, maxC, absenceDays, excludedStr = std::move(excludedStr),
                                questEditorId = std::move(questEditorId),
                                scriptName = std::move(scriptName),
                                functionName = std::move(functionName)]() mutable {
+                if (!AsyncDispatch::IsCurrent(token)) return;
             auto prefetch = NPCIndex::GetSingleton()->FetchStoryDMPhaseAPrefetch(maxC, absenceDays);
 
             // Phase A — main thread (engine snapshot using pre-fetched SQL).
@@ -2670,27 +2799,30 @@ namespace IntelEngine::Papyrus {
                 logger::error("BeginAsyncStoryDMTick: TaskInterface unavailable, dropped");
                 return;
             }
-            task->AddTask([maxC, absenceDays, prefetch = std::move(prefetch),
+            task->AddTask([token, maxC, absenceDays, prefetch = std::move(prefetch),
                            excludedStr = std::move(excludedStr),
                            questEditorId = std::move(questEditorId),
                            scriptName = std::move(scriptName),
                            functionName = std::move(functionName)]() mutable {
+                if (!AsyncDispatch::IsCurrent(token)) return;
                 auto snap = NPCIndex::GetSingleton()->BuildStoryDMTickSnapshot(maxC, absenceDays, prefetch);
                 bool playerAtInn = FactionPolitics::IsPlayerAtInn();
                 float currentGameTime = snap.currentGameTime;
 
                 if (snap.candidates.empty()) {
-                    AsyncDispatch::ExecuteQuestFunctionString(questEditorId, scriptName, functionName, "");
+                    DeliverContext(token, questEditorId, scriptName, functionName, "");
                     return;
                 }
 
                 // Phase B — worker thread: scoring + per-candidate SQL + markdown.
-                AsyncDispatch::Submit([snap = std::move(snap), playerAtInn, currentGameTime,
+                AsyncDispatch::Submit(token, [token, snap = std::move(snap), playerAtInn, currentGameTime,
                                        excludedStr = std::move(excludedStr),
                                        questEditorId = std::move(questEditorId),
                                        scriptName = std::move(scriptName),
                                        functionName = std::move(functionName)]() mutable {
-                    std::string md = NPCIndex::GetSingleton()->BuildDungeonMasterContextFromSnapshot(snap);
+                if (!AsyncDispatch::IsCurrent(token)) return;
+                    NPCIndex::CandidatePool pool;
+                    std::string md = NPCIndex::GetSingleton()->BuildDungeonMasterContextFromSnapshot(snap, pool);
                     std::string requestJson;
                     if (!md.empty()) {
                         requestJson = BuildStoryDMRequestJsonCore(md, excludedStr, playerAtInn, currentGameTime);
@@ -2701,11 +2833,13 @@ namespace IntelEngine::Papyrus {
                         logger::error("BeginAsyncStoryDMTick Phase C: TaskInterface unavailable, callback dropped");
                         return;
                     }
-                    t2->AddTask([questEditorId = std::move(questEditorId),
+                    t2->AddTask([token, questEditorId = std::move(questEditorId),
                                  scriptName = std::move(scriptName),
                                  functionName = std::move(functionName),
-                                 requestJson = std::move(requestJson)]() mutable {
-                        AsyncDispatch::ExecuteQuestFunctionString(questEditorId, scriptName, functionName, requestJson);
+                                 requestJson = std::move(requestJson), pool = std::move(pool)]() mutable {
+                if (!AsyncDispatch::IsCurrent(token)) return;
+                        NPCIndex::GetSingleton()->PublishCandidatePool(false, std::move(pool));
+                        DeliverContext(token, questEditorId, scriptName, functionName, requestJson);
                     });
                 });
             });
@@ -3521,7 +3655,9 @@ namespace IntelEngine::Papyrus {
         RE::TESObjectREFR* coffin = nullptr;
         RE::TESObjectREFR* shrine = nullptr;
 
-        cell->ForEachReference([&](RE::TESObjectREFR& ref) {
+        cell->ForEachReference([&](RE::TESObjectREFR* referencePtr) {
+            if (!referencePtr) return RE::BSContainer::ForEachResult::kContinue;
+            auto& ref = *referencePtr;
             if (ref.IsDisabled()) return RE::BSContainer::ForEachResult::kContinue;
 
             auto* baseObj = ref.GetBaseObject();
@@ -3634,7 +3770,9 @@ namespace IntelEngine::Papyrus {
 
         const char* tag = furnitureOnly ? "UsablePrisonerScan" : "PrisonerScan";
 
-        cell->ForEachReference([&](RE::TESObjectREFR& ref) {
+        cell->ForEachReference([&](RE::TESObjectREFR* referencePtr) {
+            if (!referencePtr) return RE::BSContainer::ForEachResult::kContinue;
+            auto& ref = *referencePtr;
             if (ref.IsDisabled()) return RE::BSContainer::ForEachResult::kContinue;
 
             auto* baseObj = ref.GetBaseObject();
@@ -3702,7 +3840,9 @@ namespace IntelEngine::Papyrus {
         RE::TESObjectREFR* coffin = nullptr;
         RE::TESObjectREFR* shrine = nullptr;
 
-        cell->ForEachReference([&](RE::TESObjectREFR& ref) {
+        cell->ForEachReference([&](RE::TESObjectREFR* referencePtr) {
+            if (!referencePtr) return RE::BSContainer::ForEachResult::kContinue;
+            auto& ref = *referencePtr;
             if (ref.IsDisabled()) return RE::BSContainer::ForEachResult::kContinue;
             auto* baseObj = ref.GetBaseObject();
             if (!baseObj) return RE::BSContainer::ForEachResult::kContinue;
@@ -4043,6 +4183,9 @@ namespace IntelEngine::Papyrus {
                                   RE::TESQuest* callbackQuest,
                                   RE::BSFixedString callbackScript,
                                   RE::BSFixedString callbackFn) {
+        const auto token = AsyncDispatch::BeginRequest(AsyncDispatch::Lane::Politics);
+        if (!AsyncDispatch::IsCurrent(token)) return;
+        MemoryDB::GetSingleton()->RefreshEngineSnapshot();
         if (!callbackQuest) {
             logger::error("BeginAsyncPoliticalTick: null callback quest");
             return;
@@ -4059,28 +4202,30 @@ namespace IntelEngine::Papyrus {
         auto* politics = FactionPolitics::GetSingleton();
         if (!politics->IsReady()) {
             // Empty-context sentinel: consistent "" across all 3 BeginAsync* paths.
-            AsyncDispatch::ExecuteQuestFunctionString(questEditorId, scriptName, functionName, "");
+            DeliverContext(token, questEditorId, scriptName, functionName, "");
             return;
         }
 
         // Phase A — main thread.
         auto snap = politics->BuildPoliticsTickSnapshot(currentGameTime);
 
-        AsyncDispatch::Submit([snap = std::move(snap),
+        AsyncDispatch::Submit(token, [token, snap = std::move(snap),
                                questEditorId = std::move(questEditorId),
                                scriptName = std::move(scriptName),
                                functionName = std::move(functionName)]() mutable {
+                if (!AsyncDispatch::IsCurrent(token)) return;
             std::string requestJson = FactionPolitics::GetSingleton()->BuildPoliticalContextFromSnapshot(snap);
             auto* task = SKSE::GetTaskInterface();
             if (!task) {
                 logger::error("BeginAsyncPoliticalTick: TaskInterface unavailable, callback dropped");
                 return;
             }
-            task->AddTask([questEditorId = std::move(questEditorId),
+            task->AddTask([token, questEditorId = std::move(questEditorId),
                            scriptName = std::move(scriptName),
                            functionName = std::move(functionName),
                            requestJson = std::move(requestJson)]() mutable {
-                AsyncDispatch::ExecuteQuestFunctionString(questEditorId, scriptName, functionName, requestJson);
+                if (!AsyncDispatch::IsCurrent(token)) return;
+                DeliverContext(token, questEditorId, scriptName, functionName, requestJson);
             });
         });
     }

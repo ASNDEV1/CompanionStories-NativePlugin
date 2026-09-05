@@ -40,6 +40,12 @@ namespace IntelEngine {
             return &instance;
         }
 
+        // Versioned save-local battle authority. Revert never mutates game actors.
+        static constexpr std::uint32_t kSerializationTag = 0x49454254; // IEBT
+        void Save(SKSE::SerializationInterface* serialization);
+        void Load(SKSE::SerializationInterface* serialization, std::uint32_t version, std::uint32_t length);
+        void Revert();
+
         // =================================================================
         // Pending Battles (location-based, spawn on player proximity)
         // =================================================================
@@ -95,7 +101,7 @@ namespace IntelEngine {
 
         /** Register a spawned actor in the battle.
          *  tier: 0=generic soldier, 1=recruited NPC, 2=faction leader */
-        bool RegisterActor(RE::Actor* actor, const std::string& factionId, int tier);
+        bool RegisterActor(RE::Actor* actor, const std::string& factionId, int tier, bool ownedSpawn = false);
 
         /** Get count of alive actors for a faction. */
         int GetAliveCount(const std::string& factionId) const;
@@ -288,6 +294,7 @@ namespace IntelEngine {
             std::string factionId;
             int tier = 0;            // 0=generic, 1=recruited, 2=leader
             bool alive = true;
+            bool ownedSpawn = false;
         };
 
         struct BattleState {
@@ -343,6 +350,15 @@ namespace IntelEngine {
         // Non-battle actors modified during battle (guards added to battle faction + teammate).
         // Tracked for reliable cleanup — ForEachLoadedActor misses unloaded actors.
         std::vector<RE::FormID> modifiedGuardFormIds_;
+        struct FactionLease {
+            RE::FormID actor = 0;
+            RE::FormID faction = 0;
+            int rank = -1;
+            int appliedRank = -1;
+        };
+        std::vector<FactionLease> guardFactionLeases_;
+        std::vector<FactionLease> playerCrimeLeases_;
+        mutable std::mutex ownershipMutex_;
         bool playerCrimeFactionsRemoved_ = false;  // track if player needs crime faction restore
 
         // Pending battles (location-based, waiting for player proximity)

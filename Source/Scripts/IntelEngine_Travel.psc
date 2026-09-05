@@ -529,7 +529,7 @@ EndFunction
 ; teleporting, floor-Z verification, and state transitions all behave
 ; identically to the 3s poll's arrival branch.
 Function OnProximityArrived(String slotStr)
-    Int slot = slotStr as Int
+    Int slot = IntelEngine.ConsumeProximityReceipt(slotStr)
     If slot < 0 || slot >= Core.MAX_SLOTS
         Return
     EndIf
